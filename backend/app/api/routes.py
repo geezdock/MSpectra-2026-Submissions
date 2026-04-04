@@ -2802,6 +2802,16 @@ def candidate_profile_upload(request_obj: Request, payload: ProfileUploadPayload
 
     uploaded = uploaded_rows[0] if isinstance(uploaded_rows, list) else uploaded_rows
 
+    # Best-effort scoring on upload so admin views can show resume + score immediately.
+    # If scoring provider is unavailable, keep upload successful and let admins retry later.
+    if isinstance(uploaded, dict):
+        try:
+            analysis = _build_resume_analysis(candidate, uploaded)
+            _persist_candidate_analysis(candidate["id"], analysis)
+            candidate = {**candidate, **analysis}
+        except Exception:
+            pass
+
     return {
         "message": "Profile upload saved to Supabase",
         "candidate": candidate,
@@ -3397,9 +3407,13 @@ def admin_candidate_details(request_obj: Request, candidate_id: str) -> dict[str
             inferred_role = None
 
     if latest_upload and not candidate.get("ai_summary"):
-        analysis = _build_resume_analysis(candidate, latest_upload)
-        _persist_candidate_analysis(candidate["id"], analysis)
-        candidate = {**candidate, **analysis}
+        try:
+            analysis = _build_resume_analysis(candidate, latest_upload)
+            _persist_candidate_analysis(candidate["id"], analysis)
+            candidate = {**candidate, **analysis}
+        except Exception:
+            # Keep admin detail view available even if scoring provider is down.
+            pass
 
     return _candidate_detail_payload(
         candidate,

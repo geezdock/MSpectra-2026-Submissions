@@ -1,8 +1,13 @@
 import axios from 'axios';
-import { supabase } from './supabase';
+import { hasSupabaseConfig, supabase } from './supabase';
+
+const envApiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').trim();
+const isBrowser = typeof window !== 'undefined';
+const isLocalHostname = isBrowser && ['localhost', '127.0.0.1'].includes(window.location.hostname);
+const resolvedApiBaseUrl = envApiBaseUrl || (isLocalHostname ? 'http://127.0.0.1:8000' : '');
 
 const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000',
+  baseURL: resolvedApiBaseUrl,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -11,6 +16,16 @@ const api = axios.create({
 
 api.interceptors.request.use(
   async (config) => {
+    if (!api.defaults.baseURL) {
+      throw new Error(
+        'API is not configured. Set VITE_API_BASE_URL in frontend/.env and restart the frontend server.',
+      );
+    }
+
+    if (!hasSupabaseConfig) {
+      return config;
+    }
+
     const {
       data: { session },
     } = await supabase.auth.getSession();
@@ -48,7 +63,7 @@ api.interceptors.response.use(
       errorMsg = '408 Timeout: Request took too long. Backend may not be responding.';
     } else if (networkError?.includes('CORS')) {
       errorMsg = 'CORS Error: Backend or frontend URL mismatch. Check that server is running.';
-    } else if (networkError?.includes('ERR_FAILED') || networkError?.includes('connect')) {
+    } else if (networkError?.includes('ERR_NETWORK') || networkError?.includes('ERR_FAILED') || networkError?.includes('connect')) {
       errorMsg = 'Network Error: Cannot connect to backend at ' + api.defaults.baseURL;
     } else {
       errorMsg = detail || message || networkError || 'Unexpected API error';

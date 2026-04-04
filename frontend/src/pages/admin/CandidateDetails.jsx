@@ -1,5 +1,5 @@
 import React from 'react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { ChevronLeft, FileText, MicVocal, PlayCircle, Sparkle, WandSparkles } from 'lucide-react';
@@ -11,6 +11,7 @@ import { INTERVIEW_ROLE_OPTIONS } from '../../lib/interviewRoles';
 
 export default function CandidateDetails() {
   const { id } = useParams();
+  const hasLoadedDetailsRef = useRef(false);
   const [loading, setLoading] = useState(true);
   const [details, setDetails] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -70,10 +71,15 @@ export default function CandidateDetails() {
   };
 
   useEffect(() => {
+    let cancelled = false;
+
     const fetchCandidateDetails = async () => {
       try {
         const response = await api.get(`/admin/candidates/${id}`);
+        if (cancelled) return;
+
         setDetails(response.data);
+        hasLoadedDetailsRef.current = true;
         setTargetRole(response.data?.candidate?.targetRole || '');
         setAdminOverrideRole(response.data?.candidate?.adminOverrideRole || '');
         setCandidateStage(response.data?.candidate?.currentStage || 'profile_pending');
@@ -91,13 +97,21 @@ export default function CandidateDetails() {
           setSessionDetails(null);
         }
       } catch (_error) {
-        setDetails(null);
+        if (!cancelled && !hasLoadedDetailsRef.current) {
+          setDetails(null);
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     };
 
     fetchCandidateDetails();
+
+    return () => {
+      cancelled = true;
+    };
   }, [id]);
 
   const onAnalyzeResume = async () => {

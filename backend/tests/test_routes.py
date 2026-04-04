@@ -24,6 +24,72 @@ def test_is_admin_checks_metadata_and_email():
     assert not routes._is_admin({"email": "candidate@example.com"})
 
 
+def test_candidate_profile_upload_persists_resume_analysis_when_available(monkeypatch):
+    persisted = {}
+
+    def fake_get_supabase_user(_access_token):
+        return {"id": "user-1", "email": "candidate@example.com"}
+
+    def fake_get_or_create_candidate(_user):
+        return {"id": "candidate-1", "full_name": "Alice Candidate", "role": "candidate"}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path == "/rest/v1/profile_uploads?select=*" and method == "POST":
+            return [
+                {
+                    "id": "upload-1",
+                    "candidate_id": "candidate-1",
+                    "file_name": "resume.pdf",
+                    "file_path": "user-1/resumes/resume.pdf",
+                    "file_url": "https://example.com/resume.pdf",
+                    "mime_type": "application/pdf",
+                    "file_size": 12345,
+                    "status": "uploaded",
+                }
+            ]
+        if path.startswith("/rest/v1/candidates?id=eq.candidate-1") and method == "PATCH":
+            return None
+        raise AssertionError(f"Unexpected request: {path} {method}")
+
+    def fake_build_resume_analysis(candidate, latest_upload):
+        assert candidate["id"] == "candidate-1"
+        assert latest_upload["id"] == "upload-1"
+        return {
+            "ai_summary": "Strong backend fundamentals",
+            "ai_score": 82,
+            "ai_skills": ["Python", "FastAPI"],
+        }
+
+    def fake_persist_candidate_analysis(candidate_id, analysis):
+        persisted["candidate_id"] = candidate_id
+        persisted["analysis"] = analysis
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "_build_resume_analysis", fake_build_resume_analysis)
+    monkeypatch.setattr(routes, "_persist_candidate_analysis", fake_persist_candidate_analysis)
+
+    response = client.post(
+        "/candidate/profile-upload",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "filename": "resume.pdf",
+            "size": 12345,
+            "type": "application/pdf",
+            "filePath": "user-1/resumes/resume.pdf",
+            "fileUrl": "https://example.com/resume.pdf",
+            "targetRole": "Backend Developer",
+            "submittedAt": "2026-04-04T00:00:00Z",
+        },
+    )
+
+    assert response.status_code == 200
+    assert persisted["candidate_id"] == "candidate-1"
+    assert persisted["analysis"]["ai_score"] == 82
+    assert response.json()["candidate"]["ai_score"] == 82
+
+
 def test_admin_candidates_filters_by_stage(monkeypatch):
     def fake_get_supabase_user(_access_token):
         return {"id": "admin-1", "email": "admin@example.com", "app_metadata": {"role": "admin"}}
@@ -141,6 +207,52 @@ def test_admin_analyze_resume_can_queue_background_job(monkeypatch):
     assert response.json() == {"jobId": "job-123", "status": "queued", "type": "resume_analysis"}
     assert submitted["job_type"] == "resume_analysis"
     assert submitted["context"]["candidateId"] == "candidate-1"
+
+
+def test_admin_candidate_details_does_not_fail_when_resume_analysis_errors(monkeypatch):
+    def fake_get_supabase_user(_access_token):
+        return {"id": "admin-1", "email": "admin@example.com", "app_metadata": {"role": "admin"}}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/candidates?id=eq.candidate-1&select=*") and method == "GET":
+            return [
+                {
+                    "id": "candidate-1",
+                    "full_name": "Alice Candidate",
+                    "role": "candidate",
+                    "current_stage": "profile_pending",
+                    "ai_summary": None,
+                }
+            ]
+        if path.startswith("/rest/v1/profile_uploads?candidate_id=eq.candidate-1&select=*&order=created_at.desc") and method == "GET":
+            return [
+                {
+                    "id": "upload-1",
+                    "candidate_id": "candidate-1",
+                    "file_name": "resume.pdf",
+                    "file_url": "https://example.com/resume.pdf",
+                    "mime_type": "application/pdf",
+                    "file_size": 12345,
+                }
+            ]
+        if path.startswith("/rest/v1/interview_slots?candidate_id=eq.candidate-1&select=*&order=slot_time.asc") and method == "GET":
+            return []
+        if path.startswith("/rest/v1/interview_sessions?candidate_id=eq.candidate-1&select=*&order=started_at.desc") and method == "GET":
+            return []
+        if path.startswith("/rest/v1/interview_artifacts?candidate_id=eq.candidate-1&select=*&order=created_at.desc") and method == "GET":
+            return []
+        raise AssertionError(f"Unexpected request: {path} {method}")
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "_build_resume_analysis", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("llm down")))
+
+    response = client.get("/admin/candidates/candidate-1", headers={"Authorization": "Bearer test-token"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["candidate"]["id"] == "candidate-1"
+    assert payload["latestUpload"]["id"] == "upload-1"
 
 
 def test_admin_audit_logs_endpoint_paginates(monkeypatch):
