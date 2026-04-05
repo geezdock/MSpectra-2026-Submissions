@@ -209,6 +209,38 @@ def test_admin_analyze_resume_can_queue_background_job(monkeypatch):
     assert submitted["context"]["candidateId"] == "candidate-1"
 
 
+def test_admin_cleanup_expired_interview_artifacts_writes_single_audit_log(monkeypatch):
+    audit_log_calls = []
+
+    def fake_get_supabase_user(_access_token):
+        return {"id": "admin-1", "email": "admin@example.com", "app_metadata": {"role": "admin"}}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_artifacts?select=*&expires_at=lt.") and method == "GET":
+            return []
+        if path.startswith("/rest/v1/admin_audit_logs?select=*") and method == "POST":
+            audit_log_calls.append(body or {})
+            return None
+        raise AssertionError(f"Unexpected request: {path} {method}")
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+
+    response = client.post(
+        "/admin/interview-artifacts/cleanup",
+        headers={"Authorization": "Bearer test-token"},
+        json={"limit": 25, "runInBackground": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["deletedArtifacts"] == 0
+    assert response.json()["errors"] == []
+    assert len(audit_log_calls) == 1
+    assert audit_log_calls[0]["action"] == "interview_artifacts_cleanup_completed"
+    assert audit_log_calls[0]["entity_type"] == "interview_artifact"
+    assert audit_log_calls[0]["metadata"]["errors"] == 0
+
+
 def test_admin_candidate_details_does_not_fail_when_resume_analysis_errors(monkeypatch):
     def fake_get_supabase_user(_access_token):
         return {"id": "admin-1", "email": "admin@example.com", "app_metadata": {"role": "admin"}}
@@ -403,6 +435,100 @@ def test_candidate_realtime_token_requires_in_progress_session(monkeypatch):
     assert "in-progress" in response.json()["detail"]
 
 
+def test_candidate_start_compat_get_endpoint_calls_start_with_default_consent(monkeypatch):
+    captured = {}
+
+    def fake_start(_request_obj, payload):
+        captured["consent"] = payload.consentGiven
+        return {"message": "Interview session started"}
+
+    monkeypatch.setattr(routes, "candidate_interview_session_start", fake_start)
+
+    response = client.get(
+        "/candidate/interview-session/start",
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "Interview session started"
+    assert captured["consent"] is True
+
+
+def test_candidate_respond_compat_endpoint_falls_back_to_placeholder_session_id(monkeypatch):
+    captured = {}
+
+    def fake_next_question(_request_obj, session_id, payload):
+        captured["session_id"] = session_id
+        captured["questions_asked"] = payload.questionsAsked
+        captured["turn_count"] = len(payload.transcriptTurns or [])
+        return {
+            "completed": False,
+            "question": "Q1/6: Tell me about yourself.",
+            "questionNumber": 1,
+            "maxQuestions": 6,
+            "transcriptVersion": 1,
+        }
+
+    monkeypatch.setattr(routes, "candidate_interview_session_next_question", fake_next_question)
+
+    response = client.post(
+        "/candidate/interview-session/respond",
+        headers={"Authorization": "Bearer test-token"},
+        json={"questionsAsked": 0, "transcriptTurns": []},
+    )
+
+    assert response.status_code == 200
+    assert captured["session_id"] == "00000000-0000-0000-0000-000000000000"
+    assert captured["questions_asked"] == 0
+    assert captured["turn_count"] == 0
+    assert response.json()["questionNumber"] == 1
+
+
+def test_candidate_end_compat_endpoint_uses_latest_in_progress_session(monkeypatch):
+    captured = {}
+
+    def fake_get_supabase_user(_access_token):
+        return {"id": "user-1", "email": "candidate@example.com"}
+
+    def fake_get_or_create_candidate(_user):
+        return {"id": "candidate-1"}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if (
+            path.startswith("/rest/v1/interview_sessions?")
+            and "candidate_id=eq.candidate-1" in path
+            and "status=eq.in_progress" in path
+            and method == "GET"
+        ):
+            return [{"id": "11111111-1111-1111-1111-111111111111", "status": "in_progress"}]
+        raise AssertionError(f"Unexpected request: {path} {method}")
+
+    def fake_terminate(_request_obj, session_id, payload):
+        captured["session_id"] = session_id
+        captured["reason"] = payload.reason
+        return {
+            "message": "Interview session terminated",
+            "sessionId": session_id,
+            "reason": payload.reason,
+            "endedAt": "2026-04-05T00:00:00Z",
+        }
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "candidate_interview_session_terminate", fake_terminate)
+
+    response = client.get(
+        "/candidate/interview-session/end",
+        headers={"Authorization": "Bearer test-token"},
+    )
+
+    assert response.status_code == 200
+    assert captured["session_id"] == "11111111-1111-1111-1111-111111111111"
+    assert captured["reason"] == "manual_end"
+    assert response.json()["sessionId"] == "11111111-1111-1111-1111-111111111111"
+
+
 def test_candidate_complete_endpoint_is_idempotent_for_completed_session(monkeypatch):
     def fake_get_supabase_user(_access_token):
         return {"id": "user-1", "email": "candidate@example.com"}
@@ -540,6 +666,241 @@ def test_candidate_groq_next_question_prefers_backend_relevant_problem(monkeypat
 
     assert response.status_code == 200
     assert response.json()["question"].startswith("Q2/6:")
+
+
+def test_candidate_next_question_groq_mode_enforces_token_limit_and_auto_completes(monkeypatch):
+    class FakeGroqProvider:
+        def is_configured(self):
+            return True
+
+        def chat_completion(self, payload, timeout_seconds=60):
+            assert payload["max_tokens"] == 300
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "INTERVIEW_COMPLETE",
+                        }
+                    }
+                ]
+            }
+
+    finalized = {}
+
+    def fake_get_supabase_user(_access_token):
+        return {"id": "user-1", "email": "candidate@example.com"}
+
+    def fake_get_or_create_candidate(_user):
+        return {"id": "candidate-1", "ai_summary": "Strong Python and REST fundamentals."}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?") and method == "GET":
+            return [{"id": "11111111-1111-1111-1111-111111111111", "status": "in_progress", "interview_role": "Backend Developer"}]
+        if path.startswith("/rest/v1/job_specifications?") and method == "GET":
+            return []
+        raise AssertionError(f"Unexpected request: {path}")
+
+    def fake_finalize_interview_session_from_transcript(session_id, candidate, session_row, transcript_turns, completion_reason):
+        finalized["session_id"] = session_id
+        finalized["candidate_id"] = candidate["id"]
+        finalized["completion_reason"] = completion_reason
+        finalized["turn_count"] = len(transcript_turns)
+        return {"sessionId": session_id, "status": "completed", "scoringStatus": "completed"}
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_realtime_provider="groq", interview_turn_provider="groq", groq_interview_max_tokens=300))
+    monkeypatch.setattr(routes, "get_llm_provider_by_name", lambda provider_name: FakeGroqProvider() if provider_name == "groq" else None)
+    monkeypatch.setattr(routes, "_finalize_interview_session_from_transcript", fake_finalize_interview_session_from_transcript)
+
+    response = client.post(
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
+        headers={"Authorization": "Bearer test-token"},
+        json={"questionsAsked": 1, "transcriptTurns": [{"speaker": "candidate", "text": "answer"}]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["completed"] is True
+    assert payload["autoCompleted"] is True
+    assert payload["scoringStatus"] == "completed"
+    assert finalized["completion_reason"] == "interview_complete_sentinel"
+
+
+def test_candidate_next_question_returns_transcript_version(monkeypatch):
+    calls = []
+
+    def fake_get_supabase_user(_access_token):
+        return {"id": "user-1", "email": "candidate@example.com"}
+
+    def fake_get_or_create_candidate(_user):
+        return {"id": "candidate-1", "ai_summary": "Strong Python and REST fundamentals."}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?") and method == "GET":
+            return [{"id": "11111111-1111-1111-1111-111111111111", "status": "in_progress", "interview_role": "Backend Developer"}]
+        if path.startswith("/rest/v1/job_specifications?") and method == "GET":
+            return []
+        raise AssertionError(f"Unexpected request: {path}")
+
+    def fake_upsert_interview_transcript_snapshot(session_id, candidate_id, transcript_turns, transcript_value=None, requested_version=None):
+        calls.append({"session_id": session_id, "candidate_id": candidate_id, "turn_count": len(transcript_turns)})
+        return True, 10 if len(calls) > 1 else 9
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_get_or_create_candidate", fake_get_or_create_candidate)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "_upsert_interview_transcript_snapshot", fake_upsert_interview_transcript_snapshot)
+    monkeypatch.setattr(routes, "_generate_next_interview_question_from_leetcode", lambda **_kwargs: "Q2/6: Explain API versioning strategy.")
+    monkeypatch.setattr(routes, "settings", replace(routes.settings, interview_turn_provider="heuristic"))
+
+    response = client.post(
+        "/candidate/interview-session/11111111-1111-1111-1111-111111111111/next-question",
+        headers={"Authorization": "Bearer test-token"},
+        json={
+            "questionsAsked": 1,
+            "transcriptTurns": [
+                {"speaker": "ai", "text": "Q1/6: Intro question"},
+                {"speaker": "candidate", "text": "My answer"},
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["completed"] is False
+    assert payload["transcriptVersion"] == 10
+    assert len(calls) == 2
+
+
+def test_finalize_interview_session_from_transcript_is_idempotent_when_already_completed(monkeypatch):
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?id=eq.session-1&candidate_id=eq.candidate-1") and method == "GET":
+            return [{"id": "session-1", "status": "completed"}]
+        if path.startswith("/rest/v1/interview_artifacts?session_id=eq.session-1&candidate_id=eq.candidate-1") and method == "GET":
+            return [{"id": "artifact-1", "score_payload": {"scoringStatus": "completed"}}]
+        raise AssertionError(f"Unexpected request: {path} {method}")
+
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+
+    result = routes._finalize_interview_session_from_transcript(
+        session_id="session-1",
+        candidate={"id": "candidate-1"},
+        session_row={"id": "session-1", "status": "completed"},
+        transcript_turns=[],
+        completion_reason="interview_complete_sentinel",
+    )
+
+    assert result["sessionId"] == "session-1"
+    assert result["status"] == "completed"
+    assert result["scoringStatus"] == "completed"
+    assert result["idempotent"] is True
+
+
+def test_admin_autocomplete_stale_interview_sessions_completes_sessions(monkeypatch):
+    finalized = []
+
+    def fake_get_supabase_user(_access_token):
+        return {"id": "admin-1", "email": "admin@example.com", "app_metadata": {"role": "admin"}}
+
+    def fake_finalize_interview_session_from_transcript(session_id, candidate, session_row, transcript_turns, completion_reason):
+        finalized.append(
+            {
+                "session_id": session_id,
+                "candidate_id": candidate["id"],
+                "completion_reason": completion_reason,
+                "turn_count": len(transcript_turns),
+            }
+        )
+        return {"sessionId": session_id, "status": "completed", "scoringStatus": "completed"}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?status=eq.in_progress") and method == "GET":
+            return [{"id": "session-1", "candidate_id": "candidate-1", "status": "in_progress", "interview_role": "Backend Developer"}]
+        if path.startswith("/rest/v1/candidates?id=eq.candidate-1") and method == "GET":
+            return [{"id": "candidate-1", "ai_score": 80}]
+        if path.startswith("/rest/v1/interview_artifacts?session_id=eq.session-1&candidate_id=eq.candidate-1") and method == "GET":
+            return [{"id": "artifact-1", "score_payload": {"transcriptTurns": [{"speaker": "candidate", "text": "Answer"}]}}]
+        if path.startswith("/rest/v1/admin_audit_logs?select=*") and method == "POST":
+            return None
+        raise AssertionError(f"Unexpected request: {path} {method}")
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "_finalize_interview_session_from_transcript", fake_finalize_interview_session_from_transcript)
+
+    response = client.post(
+        "/admin/interview-sessions/auto-complete-stale",
+        headers={"Authorization": "Bearer test-token"},
+        json={"limit": 10, "idleMinutes": 30, "runInBackground": False},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["evaluated"] == 1
+    assert payload["completedSessions"] == 1
+    assert payload["pendingSessions"] == 0
+    assert len(finalized) == 1
+    assert finalized[0]["completion_reason"] == "stale_session_timeout"
+
+
+def test_admin_autocomplete_stale_interview_sessions_can_queue_background_job(monkeypatch):
+    def fake_get_supabase_user(_access_token):
+        return {"id": "admin-1", "email": "admin@example.com", "app_metadata": {"role": "admin"}}
+
+    def fake_submit_background_job(job_type, handler, **context):
+        return {"id": "job-xyz", "status": "queued", "type": job_type, "context": context}
+
+    monkeypatch.setattr(routes, "_get_supabase_user", fake_get_supabase_user)
+    monkeypatch.setattr(routes, "_submit_background_job", fake_submit_background_job)
+    monkeypatch.setattr(routes, "_record_admin_audit_log", lambda *_args, **_kwargs: None)
+
+    response = client.post(
+        "/admin/interview-sessions/auto-complete-stale",
+        headers={"Authorization": "Bearer test-token"},
+        json={"limit": 25, "idleMinutes": 45, "runInBackground": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"jobId": "job-xyz", "status": "queued", "type": "stale_interview_autocomplete"}
+
+
+def test_finalize_interview_session_from_transcript_sets_pending_when_scoring_fails(monkeypatch):
+    captured_post = {}
+    session_get_calls = {"count": 0}
+
+    def fake_supabase_request(path, method="GET", body=None, bearer_token=None, use_service_role=False):
+        if path.startswith("/rest/v1/interview_sessions?id=eq.session-2&candidate_id=eq.candidate-2") and method == "GET":
+            session_get_calls["count"] += 1
+            if session_get_calls["count"] == 1:
+                return [{"id": "session-2", "status": "in_progress", "interview_role": "Backend Developer"}]
+            return [{"id": "session-2", "status": "completed", "interview_role": "Backend Developer"}]
+        if path.startswith("/rest/v1/interview_artifacts?session_id=eq.session-2&candidate_id=eq.candidate-2") and method == "GET":
+            return []
+        if path.startswith("/rest/v1/interview_sessions?id=eq.session-2&status=eq.in_progress") and method == "PATCH":
+            return None
+        if path.startswith("/rest/v1/interview_artifacts?select=*") and method == "POST":
+            captured_post["body"] = body or {}
+            return [{"id": "artifact-new"}]
+        raise AssertionError(f"Unexpected request: {path} {method}")
+
+    monkeypatch.setattr(routes, "_supabase_request", fake_supabase_request)
+    monkeypatch.setattr(routes, "_build_interview_scoring_rubric", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("provider down")))
+
+    result = routes._finalize_interview_session_from_transcript(
+        session_id="session-2",
+        candidate={"id": "candidate-2", "ai_score": 77},
+        session_row={"id": "session-2", "status": "in_progress", "interview_role": "Backend Developer"},
+        transcript_turns=[{"speaker": "candidate", "text": "answer"}],
+        completion_reason="interview_complete_sentinel",
+    )
+
+    assert result["status"] == "completed"
+    assert result["scoringStatus"] == "pending"
+    assert result["idempotent"] is False
+    score_payload = captured_post["body"]["score_payload"]
+    assert score_payload["scoringStatus"] == "pending"
 
 
 def test_candidate_next_question_switches_to_role_theory_after_three_questions(monkeypatch):

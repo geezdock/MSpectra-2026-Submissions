@@ -109,6 +109,12 @@ class InterviewSessionNextQuestionPayload(BaseModel):
     questionsAsked: int = 0
 
 
+class InterviewSessionRespondPayload(BaseModel):
+    sessionId: str | None = None
+    transcriptTurns: list[dict[str, Any]] | None = None
+    questionsAsked: int = 0
+
+
 class AdminHiringOutcomePayload(BaseModel):
     outcome: str
     retentionDays: int = 30
@@ -116,6 +122,12 @@ class AdminHiringOutcomePayload(BaseModel):
 
 class AdminCleanupArtifactsPayload(BaseModel):
     limit: int = 100
+    runInBackground: bool = False
+
+
+class AdminAutoCompleteStaleSessionsPayload(BaseModel):
+    limit: int = 100
+    idleMinutes: int = 30
     runInBackground: bool = False
 
 
@@ -588,6 +600,287 @@ def _generate_next_interview_question_from_leetcode(
 
     expected_prefix = f"Q{next_question_number}/{max_questions}:"
     return f"{expected_prefix} {base_question}"
+
+
+def _build_transcript_from_turns(transcript_turns: list[dict[str, Any]]) -> str:
+    rows: list[str] = []
+    for index, turn in enumerate(transcript_turns):
+        if not isinstance(turn, dict):
+            continue
+        speaker = str(turn.get("speaker") or "unknown").strip().upper()
+        text = str(turn.get("text") or "").strip()
+        if not text:
+            continue
+        rows.append(f"{index + 1}. {speaker}: {text}")
+    return "\n".join(rows)
+
+
+def _extract_chat_completion_text(data: dict[str, Any]) -> str:
+    content = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content")
+    if not isinstance(content, str):
+        return ""
+    return content.strip()
+
+
+def _generate_next_interview_question_from_groq(
+    interview_role: str,
+    interview_plan: dict[str, Any],
+    resume_summary: str,
+    transcript_turns: list[dict[str, Any]],
+    next_question_number: int,
+    max_questions: int,
+) -> str:
+    provider = get_llm_provider_by_name("groq")
+    if not provider.is_configured():
+        raise SupabaseError("Groq provider is not configured")
+
+    job_context = interview_plan.get("job_context") if isinstance(interview_plan.get("job_context"), dict) else {}
+    job_title = str(job_context.get("title") or interview_role or "General Candidate").strip()
+    required_skills = job_context.get("required_skills") if isinstance(job_context.get("required_skills"), list) else []
+    responsibilities = job_context.get("key_responsibilities") if isinstance(job_context.get("key_responsibilities"), list) else []
+    transcript_text = _build_transcript_from_turns(transcript_turns)
+
+    prompt = (
+        "You are a concise live interview assistant for a turn-based interview. "
+        f"Role: {interview_role}. Job title: {job_title}. "
+        f"Question number to ask now: {next_question_number}/{max_questions}. "
+        "Ask exactly one clear question under 30 words, prefixed as Q<number>/<total>:. "
+        "Do not provide hints or answers. Avoid repeating previous topics from transcript history. "
+        "When interview should end, return exactly INTERVIEW_COMPLETE and nothing else. "
+        f"Resume summary: {resume_summary or 'Not provided'}. "
+        f"Required skills: {', '.join(str(skill) for skill in required_skills)}. "
+        f"Responsibilities: {', '.join(str(item) for item in responsibilities)}. "
+        f"Transcript history: {transcript_text or 'No prior turns.'}"
+    )
+
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [
+            {"role": "system", "content": "Respond with a single concise interview question or INTERVIEW_COMPLETE only."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.2,
+        "max_tokens": max(32, min(int(settings.groq_interview_max_tokens), 300)),
+    }
+
+    data = provider.chat_completion(payload, timeout_seconds=25)
+    question_text = _extract_chat_completion_text(data)
+    if not question_text:
+        raise SupabaseError("Groq interview provider returned an empty question")
+    return question_text
+
+
+def _finalize_interview_session_from_transcript(
+    session_id: str,
+    candidate: dict[str, Any],
+    session_row: dict[str, Any],
+    transcript_turns: list[dict[str, Any]],
+    completion_reason: str,
+) -> dict[str, Any]:
+    candidate_id = candidate.get("id") if isinstance(candidate, dict) else None
+    if not candidate_id:
+        raise SupabaseError("Candidate id is required for interview finalization")
+
+    latest_session_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate_id)}&select=*&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    latest_session = latest_session_rows[0] if isinstance(latest_session_rows, list) and latest_session_rows else session_row
+    latest_status = str((latest_session or {}).get("status") or "").strip().lower()
+
+    artifact_rows = _supabase_request(
+        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate_id)}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    existing_artifact = artifact_rows[0] if isinstance(artifact_rows, list) and artifact_rows else None
+    existing_score_payload = existing_artifact.get("score_payload") if isinstance(existing_artifact, dict) and isinstance(existing_artifact.get("score_payload"), dict) else {}
+    existing_scoring_status = existing_score_payload.get("scoringStatus") if isinstance(existing_score_payload.get("scoringStatus"), str) else None
+
+    if latest_status and latest_status != "in_progress":
+        return {
+            "sessionId": session_id,
+            "status": latest_status,
+            "scoringStatus": existing_scoring_status or "completed",
+            "idempotent": True,
+        }
+
+    ended_at = datetime.now(UTC).isoformat()
+    transcript_text = _build_transcript_from_turns(transcript_turns)
+
+    _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&status=eq.in_progress",
+        method="PATCH",
+        body={
+            "status": "completed",
+            "ended_at": ended_at,
+        },
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    post_patch_rows = _supabase_request(
+        f"/rest/v1/interview_sessions?id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate_id)}&select=*&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    post_patch = post_patch_rows[0] if isinstance(post_patch_rows, list) and post_patch_rows else latest_session
+    post_patch_status = str((post_patch or {}).get("status") or "").strip().lower()
+    if post_patch_status and post_patch_status != "completed":
+        return {
+            "sessionId": session_id,
+            "status": post_patch_status,
+            "scoringStatus": existing_scoring_status or "pending",
+            "idempotent": True,
+        }
+
+    slot_id = post_patch.get("slot_id") if isinstance(post_patch, dict) else None
+    if slot_id:
+        _supabase_request(
+            f"/rest/v1/interview_slots?id=eq.{quote(slot_id)}",
+            method="PATCH",
+            body={"status": "completed"},
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
+    interview_role = post_patch.get("interview_role") if isinstance(post_patch, dict) and post_patch.get("interview_role") else _resolve_interview_role(candidate)[0]
+    interview_plan = _build_role_specific_interview_plan(interview_role)
+    total_questions = len(interview_plan.get("questions") or [])
+    resume_score = candidate.get("ai_score") if isinstance(candidate.get("ai_score"), int) else 70
+
+    scoring_status = "completed"
+    scoring_error = None
+    scoring = None
+    try:
+        scoring = _build_interview_scoring_rubric(
+            transcript_text,
+            transcript_turns,
+            None,
+            total_questions,
+            resume_score,
+            interview_role,
+            interview_plan,
+        )
+    except Exception as exc:
+        scoring_status = "pending"
+        scoring_error = _friendly_scoring_error_message(str(exc))
+
+    final_score_payload: dict[str, Any] = {
+        "role": interview_role,
+        "resumeScore": resume_score,
+        "completionReason": completion_reason,
+        "transcriptTurns": transcript_turns,
+        "scoringStatus": scoring_status,
+        "queuedAt": datetime.now(UTC).isoformat() if scoring_status == "pending" else None,
+        "scoringError": scoring_error,
+        "evaluationVersion": "phase3-scoring-pending-v1" if scoring_status == "pending" else (scoring.get("version", "phase3-scoring-v1") if isinstance(scoring, dict) else "phase3-scoring-v1"),
+    }
+    if isinstance(scoring, dict):
+        final_score_payload.update(
+            {
+                "overallScore": scoring.get("overallScore"),
+                "answeredCount": scoring.get("answeredCount"),
+                "totalQuestions": scoring.get("totalQuestions"),
+                "scoringRubric": scoring,
+            }
+        )
+
+    if existing_artifact and existing_artifact.get("id"):
+        _supabase_request(
+            f"/rest/v1/interview_artifacts?id=eq.{quote(existing_artifact['id'])}",
+            method="PATCH",
+            body={
+                "transcript": transcript_text,
+                "score_payload": final_score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+    else:
+        _supabase_request(
+            "/rest/v1/interview_artifacts?select=*",
+            method="POST",
+            body={
+                "session_id": session_id,
+                "candidate_id": candidate["id"],
+                "transcript": transcript_text,
+                "score_payload": final_score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
+    return {
+        "sessionId": session_id,
+        "status": "completed",
+        "scoringStatus": scoring_status,
+        "idempotent": False,
+    }
+
+
+def _upsert_interview_transcript_snapshot(
+    session_id: str,
+    candidate_id: str,
+    transcript_turns: list[dict[str, Any]],
+    transcript_value: str | None = None,
+    requested_version: int | None = None,
+) -> tuple[bool, int]:
+    artifact_rows = _supabase_request(
+        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate_id)}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    existing_artifact = artifact_rows[0] if isinstance(artifact_rows, list) and artifact_rows else None
+
+    score_payload = {}
+    if isinstance(existing_artifact, dict) and isinstance(existing_artifact.get("score_payload"), dict):
+        score_payload = dict(existing_artifact.get("score_payload") or {})
+
+    existing_version_raw = score_payload.get("transcriptVersion", 0)
+    existing_version = existing_version_raw if isinstance(existing_version_raw, int) else 0
+
+    if requested_version is not None and requested_version <= existing_version:
+        return False, existing_version
+
+    next_version = requested_version if requested_version is not None else existing_version + 1
+    persisted_transcript = transcript_value if isinstance(transcript_value, str) else _build_transcript_from_turns(transcript_turns)
+
+    score_payload["transcriptTurns"] = transcript_turns
+    score_payload["autosavedAt"] = datetime.now(UTC).isoformat()
+    score_payload["transcriptVersion"] = next_version
+
+    if existing_artifact and existing_artifact.get("id"):
+        _supabase_request(
+            f"/rest/v1/interview_artifacts?id=eq.{quote(existing_artifact['id'])}",
+            method="PATCH",
+            body={
+                "transcript": persisted_transcript,
+                "score_payload": score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+    else:
+        _supabase_request(
+            "/rest/v1/interview_artifacts?select=*",
+            method="POST",
+            body={
+                "session_id": session_id,
+                "candidate_id": candidate_id,
+                "transcript": persisted_transcript,
+                "score_payload": score_payload,
+            },
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+
+    return True, next_version
 
 
 def _supabase_request(
@@ -1109,7 +1402,7 @@ def _friendly_interview_provider_error_message(raw_message: str | None) -> str:
 
 
 def _openai_chat_completion_with_retry(payload: dict[str, Any], timeout_seconds: int = 60) -> dict[str, Any]:
-    provider_chain = get_llm_provider_chain(settings.llm_provider, settings.llm_provider_fallbacks)
+    provider_chain = get_llm_provider_chain("openrouter", settings.llm_provider_fallbacks)
     configured_chain = [provider for provider in provider_chain if provider.is_configured()]
     if not configured_chain:
         raise SupabaseError("No configured LLM provider found. Check LLM_PROVIDER and fallback keys.")
@@ -1144,7 +1437,7 @@ def _openai_chat_completion_with_retry(payload: dict[str, Any], timeout_seconds:
 
 
 def _ensure_openai_scoring_ready() -> None:
-    provider_chain = get_llm_provider_chain(settings.llm_provider, settings.llm_provider_fallbacks)
+    provider_chain = get_llm_provider_chain("openrouter", settings.llm_provider_fallbacks)
     if not any(provider.is_configured() for provider in provider_chain):
         raise SupabaseError("No configured LLM provider found. Check LLM_PROVIDER and fallback keys.")
 
@@ -2070,6 +2363,54 @@ def candidate_interview_session_start(
     }
 
 
+@router.get("/candidate/interview-session/start")
+def candidate_interview_session_start_compat(
+    request_obj: Request,
+    consentGiven: bool = Query(default=True),
+) -> dict[str, Any]:
+    return candidate_interview_session_start(
+        request_obj,
+        InterviewSessionStartPayload(consentGiven=consentGiven),
+    )
+
+
+@router.get("/candidate/interview-session/end")
+def candidate_interview_session_end_compat(
+    request_obj: Request,
+    sessionId: str | None = Query(default=None),
+) -> dict[str, Any]:
+    if sessionId and not _is_valid_uuid(sessionId):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid session ID format",
+        )
+
+    resolved_session_id = (sessionId or "").strip()
+    if not resolved_session_id:
+        access_token = _get_bearer_token(request_obj)
+        user = _get_supabase_user(access_token)
+        candidate = _get_or_create_candidate(user)
+        fallback_rows = _supabase_request(
+            f"/rest/v1/interview_sessions?candidate_id=eq.{quote(candidate['id'])}&status=eq.in_progress&select=*&order=created_at.desc&limit=1",
+            method="GET",
+            bearer_token=settings.supabase_service_role_key,
+            use_service_role=True,
+        )
+        if not fallback_rows:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+        latest_in_progress = fallback_rows[0] if isinstance(fallback_rows, list) else fallback_rows
+        resolved_session_id = latest_in_progress.get("id") if isinstance(latest_in_progress, dict) else None
+
+    if not isinstance(resolved_session_id, str) or not resolved_session_id.strip():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+
+    return candidate_interview_session_terminate(
+        request_obj,
+        resolved_session_id,
+        InterviewSessionTerminatePayload(reason="manual_end"),
+    )
+
+
 @router.get("/candidate/interview-session/{session_id}")
 def candidate_interview_session_details(request_obj: Request, session_id: str) -> dict[str, Any]:
     access_token = _get_bearer_token(request_obj)
@@ -2105,6 +2446,17 @@ def candidate_interview_session_details(request_obj: Request, session_id: str) -
         interview_role = session_row.get("interview_role")
         role_source = session_row.get("role_source") or role_source
 
+    artifact_rows = _supabase_request(
+        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_row.get('id') or session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+    artifact = artifact_rows[0] if isinstance(artifact_rows, list) and artifact_rows else None
+    score_payload = artifact.get("score_payload") if isinstance(artifact, dict) and isinstance(artifact.get("score_payload"), dict) else {}
+    transcript_turns = score_payload.get("transcriptTurns") if isinstance(score_payload.get("transcriptTurns"), list) else []
+    transcript_version = score_payload.get("transcriptVersion") if isinstance(score_payload.get("transcriptVersion"), int) else 0
+
     return {
         "session": {
             "id": session_row.get("id"),
@@ -2116,6 +2468,8 @@ def candidate_interview_session_details(request_obj: Request, session_id: str) -
         "interviewPlan": _build_role_specific_interview_plan(interview_role),
         "resumeSummary": candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions.",
         "aiOutputMode": _effective_interview_output_mode(),
+        "transcriptTurns": transcript_turns,
+        "transcriptVersion": transcript_version,
     }
 
 
@@ -2295,6 +2649,15 @@ def candidate_interview_session_next_question(
         max_questions = max(1, settings.interview_max_questions)
 
     transcript_turns = payload.transcriptTurns if isinstance(payload.transcriptTurns, list) else []
+    persisted_version = None
+    try:
+        _, persisted_version = _upsert_interview_transcript_snapshot(
+            session_id=session_row.get("id") or session_id,
+            candidate_id=candidate["id"],
+            transcript_turns=transcript_turns,
+        )
+    except Exception:
+        persisted_version = None
 
     client_questions_asked = payload.questionsAsked if isinstance(payload.questionsAsked, int) and payload.questionsAsked >= 0 else 0
     inferred_questions_asked = _infer_questions_asked_from_transcript(transcript_turns)
@@ -2303,29 +2666,116 @@ def candidate_interview_session_next_question(
         questions_asked = max_questions
     next_question_number = questions_asked + 1
     if next_question_number > max_questions:
+        finalized = _finalize_interview_session_from_transcript(
+            session_id=session_row.get("id") or session_id,
+            candidate=candidate,
+            session_row=session_row,
+            transcript_turns=transcript_turns,
+            completion_reason="question_limit_reached",
+        )
         return {
             "completed": True,
             "questionNumber": questions_asked,
             "maxQuestions": max_questions,
+            "autoCompleted": True,
+            "scoringStatus": finalized.get("scoringStatus"),
+            "transcriptVersion": persisted_version,
         }
 
     resume_summary = candidate.get("ai_summary") or "Resume summary pending. Ask structured role-fit questions."
 
-    question_text = _generate_next_interview_question_from_leetcode(
-        interview_role=interview_role,
-        interview_plan=interview_plan,
-        resume_summary=resume_summary,
-        transcript_turns=transcript_turns,
-        next_question_number=next_question_number,
-        max_questions=max_questions,
-    )
+    question_text = ""
+    if settings.interview_turn_provider == "groq":
+        try:
+            question_text = _generate_next_interview_question_from_groq(
+                interview_role=interview_role,
+                interview_plan=interview_plan,
+                resume_summary=resume_summary,
+                transcript_turns=transcript_turns,
+                next_question_number=next_question_number,
+                max_questions=max_questions,
+            )
+        except Exception:
+            question_text = ""
+
+    if not question_text:
+        question_text = _generate_next_interview_question_from_leetcode(
+            interview_role=interview_role,
+            interview_plan=interview_plan,
+            resume_summary=resume_summary,
+            transcript_turns=transcript_turns,
+            next_question_number=next_question_number,
+            max_questions=max_questions,
+        )
+
+    sentinel_detected = "INTERVIEW_COMPLETE" in question_text.upper()
+    if sentinel_detected:
+        completed_turns = [
+            *transcript_turns,
+            {
+                "speaker": "ai",
+                "text": "INTERVIEW_COMPLETE",
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        ]
+        finalized = _finalize_interview_session_from_transcript(
+            session_id=session_row.get("id") or session_id,
+            candidate=candidate,
+            session_row=session_row,
+            transcript_turns=completed_turns,
+            completion_reason="interview_complete_sentinel",
+        )
+        return {
+            "completed": True,
+            "questionNumber": questions_asked,
+            "maxQuestions": max_questions,
+            "autoCompleted": True,
+            "scoringStatus": finalized.get("scoringStatus"),
+            "transcriptVersion": persisted_version,
+        }
+
+    next_turns = [
+        *transcript_turns,
+        {
+            "speaker": "ai",
+            "text": question_text,
+            "timestamp": datetime.now(UTC).isoformat(),
+        },
+    ]
+    try:
+        _, persisted_version = _upsert_interview_transcript_snapshot(
+            session_id=session_row.get("id") or session_id,
+            candidate_id=candidate["id"],
+            transcript_turns=next_turns,
+        )
+    except Exception:
+        pass
 
     return {
         "completed": False,
         "question": question_text,
         "questionNumber": next_question_number,
         "maxQuestions": max_questions,
+        "transcriptVersion": persisted_version,
     }
+
+
+@router.post("/candidate/interview-session/respond")
+def candidate_interview_session_respond_compat(
+    request_obj: Request,
+    payload: InterviewSessionRespondPayload,
+) -> dict[str, Any]:
+    requested_session_id = (payload.sessionId or "").strip()
+    fallback_session_id = "00000000-0000-0000-0000-000000000000"
+
+    return candidate_interview_session_next_question(
+        request_obj,
+        requested_session_id or fallback_session_id,
+        InterviewSessionNextQuestionPayload(
+            transcriptTurns=payload.transcriptTurns,
+            questionsAsked=payload.questionsAsked,
+        ),
+    )
 
 
 @router.patch("/candidate/interview-session/{session_id}/transcript")
@@ -2358,59 +2808,22 @@ def candidate_interview_session_patch_transcript(
     transcript_turns = payload.transcriptTurns if isinstance(payload.transcriptTurns, list) else []
     requested_version = payload.transcriptVersion if isinstance(payload.transcriptVersion, int) else None
 
-    artifact_rows = _supabase_request(
-        f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate['id'])}&select=*&order=created_at.desc&limit=1",
-        method="GET",
-        bearer_token=settings.supabase_service_role_key,
-        use_service_role=True,
+    applied, next_version = _upsert_interview_transcript_snapshot(
+        session_id=session_id,
+        candidate_id=candidate["id"],
+        transcript_turns=transcript_turns,
+        transcript_value=transcript_value,
+        requested_version=requested_version,
     )
-    existing_artifact = artifact_rows[0] if isinstance(artifact_rows, list) and artifact_rows else None
 
-    score_payload = {}
-    if isinstance(existing_artifact, dict) and isinstance(existing_artifact.get("score_payload"), dict):
-        score_payload = dict(existing_artifact.get("score_payload") or {})
-
-    existing_version_raw = score_payload.get("transcriptVersion", 0)
-    existing_version = existing_version_raw if isinstance(existing_version_raw, int) else 0
-    next_version = requested_version if requested_version is not None else existing_version + 1
-
-    if requested_version is not None and requested_version <= existing_version:
+    if not applied:
         return {
             "message": "Transcript autosave ignored due to stale version",
             "sessionId": session_id,
             "savedAt": datetime.now(UTC).isoformat(),
             "applied": False,
-            "transcriptVersion": existing_version,
+            "transcriptVersion": next_version,
         }
-
-    score_payload["transcriptTurns"] = transcript_turns
-    score_payload["autosavedAt"] = datetime.now(UTC).isoformat()
-    score_payload["transcriptVersion"] = next_version
-
-    if existing_artifact and existing_artifact.get("id"):
-        _supabase_request(
-            f"/rest/v1/interview_artifacts?id=eq.{quote(existing_artifact['id'])}",
-            method="PATCH",
-            body={
-                "transcript": transcript_value,
-                "score_payload": score_payload,
-            },
-            bearer_token=settings.supabase_service_role_key,
-            use_service_role=True,
-        )
-    else:
-        _supabase_request(
-            "/rest/v1/interview_artifacts?select=*",
-            method="POST",
-            body={
-                "session_id": session_id,
-                "candidate_id": candidate["id"],
-                "transcript": transcript_value,
-                "score_payload": score_payload,
-            },
-            bearer_token=settings.supabase_service_role_key,
-            use_service_role=True,
-        )
 
     return {
         "message": "Transcript autosaved",
@@ -3902,18 +4315,7 @@ def _admin_cleanup_expired_interview_artifacts(limit: int, actor: dict[str, Any]
             "evaluated": len(expired_artifacts) if isinstance(expired_artifacts, list) else 0,
             "deletedArtifacts": deleted_rows,
             "deletedStorageObjects": deleted_storage,
-        },
-    )
-
-    _record_admin_audit_log(
-        actor or {},
-        "interview_artifacts_cleanup_completed",
-        "interview_artifact",
-        None,
-        {
-            "evaluated": len(expired_artifacts) if isinstance(expired_artifacts, list) else 0,
-            "deletedArtifacts": deleted_rows,
-            "deletedStorageObjects": deleted_storage,
+            "errors": len(cleanup_errors),
         },
     )
 
@@ -3923,6 +4325,118 @@ def _admin_cleanup_expired_interview_artifacts(limit: int, actor: dict[str, Any]
         "deletedArtifacts": deleted_rows,
         "deletedStorageObjects": deleted_storage,
         "errors": cleanup_errors,
+    }
+
+
+@router.post("/admin/interview-sessions/auto-complete-stale")
+def admin_autocomplete_stale_interview_sessions(
+    request_obj: Request,
+    payload: AdminAutoCompleteStaleSessionsPayload,
+) -> dict[str, Any]:
+    access_token = _get_bearer_token(request_obj)
+    user = _get_supabase_user(access_token)
+    if not _is_admin(user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+
+    limit = max(1, min(int(payload.limit), 500))
+    idle_minutes = max(5, min(int(payload.idleMinutes), 24 * 60))
+
+    if payload.runInBackground:
+        _record_admin_audit_log(
+            user,
+            "stale_interview_autocomplete_queued",
+            "interview_session",
+            None,
+            {"limit": limit, "idleMinutes": idle_minutes},
+        )
+        job = _submit_background_job(
+            "stale_interview_autocomplete",
+            lambda: _admin_autocomplete_stale_interview_sessions(limit=limit, idle_minutes=idle_minutes, actor=user),
+            limit=limit,
+            idleMinutes=idle_minutes,
+        )
+        return {"jobId": job["id"], "status": job["status"], "type": job["type"]}
+
+    return _admin_autocomplete_stale_interview_sessions(limit=limit, idle_minutes=idle_minutes, actor=user)
+
+
+def _admin_autocomplete_stale_interview_sessions(
+    limit: int,
+    idle_minutes: int,
+    actor: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cutoff_iso = (datetime.now(UTC) - timedelta(minutes=idle_minutes)).isoformat()
+    stale_sessions = _supabase_request(
+        f"/rest/v1/interview_sessions?status=eq.in_progress&started_at=lt.{quote(cutoff_iso)}&select=*&order=started_at.asc&limit={limit}",
+        method="GET",
+        bearer_token=settings.supabase_service_role_key,
+        use_service_role=True,
+    )
+
+    completed_count = 0
+    pending_count = 0
+    errors: list[dict[str, str]] = []
+
+    for session_row in stale_sessions if isinstance(stale_sessions, list) else []:
+        session_id = session_row.get("id")
+        candidate_id = session_row.get("candidate_id")
+        if not session_id or not candidate_id:
+            continue
+
+        try:
+            candidate_rows = _supabase_request(
+                f"/rest/v1/candidates?id=eq.{quote(candidate_id)}&select=*&limit=1",
+                method="GET",
+                bearer_token=settings.supabase_service_role_key,
+                use_service_role=True,
+            )
+            candidate = candidate_rows[0] if isinstance(candidate_rows, list) and candidate_rows else {"id": candidate_id}
+
+            artifact_rows = _supabase_request(
+                f"/rest/v1/interview_artifacts?session_id=eq.{quote(session_id)}&candidate_id=eq.{quote(candidate_id)}&select=*&order=created_at.desc&limit=1",
+                method="GET",
+                bearer_token=settings.supabase_service_role_key,
+                use_service_role=True,
+            )
+            artifact = artifact_rows[0] if isinstance(artifact_rows, list) and artifact_rows else None
+            score_payload = artifact.get("score_payload") if isinstance(artifact, dict) and isinstance(artifact.get("score_payload"), dict) else {}
+            transcript_turns = score_payload.get("transcriptTurns") if isinstance(score_payload.get("transcriptTurns"), list) else []
+
+            finalized = _finalize_interview_session_from_transcript(
+                session_id=session_id,
+                candidate=candidate,
+                session_row=session_row,
+                transcript_turns=transcript_turns,
+                completion_reason="stale_session_timeout",
+            )
+            if finalized.get("scoringStatus") == "completed":
+                completed_count += 1
+            else:
+                pending_count += 1
+        except Exception as exc:
+            errors.append({"sessionId": str(session_id), "error": str(exc)})
+
+    _record_admin_audit_log(
+        actor or {},
+        "stale_interview_autocomplete_completed",
+        "interview_session",
+        None,
+        {
+            "evaluated": len(stale_sessions) if isinstance(stale_sessions, list) else 0,
+            "completed": completed_count,
+            "pending": pending_count,
+            "errors": len(errors),
+            "idleMinutes": idle_minutes,
+        },
+    )
+
+    return {
+        "message": "Stale interview auto-complete run finished",
+        "evaluated": len(stale_sessions) if isinstance(stale_sessions, list) else 0,
+        "completedSessions": completed_count,
+        "pendingSessions": pending_count,
+        "errors": errors,
+        "idleMinutes": idle_minutes,
     }
 
 

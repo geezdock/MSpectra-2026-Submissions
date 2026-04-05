@@ -109,6 +109,13 @@ export default function Interview() {
   const [loadingGroqQuestion, setLoadingGroqQuestion] = useState(false);
   const [speechRecognitionSupported, setSpeechRecognitionSupported] = useState(false);
   const [capturingVoiceAnswer, setCapturingVoiceAnswer] = useState(false);
+  const [submittingGroqTurn, setSubmittingGroqTurn] = useState(false);
+  const [speakingAiResponse, setSpeakingAiResponse] = useState(false);
+  const [groqDebugTimestamps, setGroqDebugTimestamps] = useState({
+    lastListenStart: null,
+    lastSubmit: null,
+    lastSpeakEnd: null,
+  });
 
   const videoRef = useRef(null);
   const mediaStreamRef = useRef(null);
@@ -137,6 +144,10 @@ export default function Interview() {
   const speechRecognitionRef = useRef(null);
   const speechFinalBufferRef = useRef('');
   const speechSilenceTimerRef = useRef(null);
+  const skipNextSpeechSubmitRef = useRef(false);
+  const groqTurnInFlightRef = useRef(false);
+  const groqAutoKickoffDoneRef = useRef(false);
+  const startVoiceAnswerCaptureRef = useRef(() => {});
 
   const questions = useMemo(() => interviewPlan?.questions ?? [], [interviewPlan]);
   const maxRealtimeQuestions = useMemo(() => {
@@ -150,19 +161,98 @@ export default function Interview() {
   const routeSessionId = location.state?.sessionData?.session?.id || null;
   const isLiveInterviewRoute = location.pathname === '/interview/live';
   const transcriptSnapshot = useMemo(() => buildTranscriptFromTurns(transcriptTurns), [transcriptTurns]);
-  const useGroqVoiceMode = useMemo(() => {
+  const usesGroqPlan = useMemo(() => {
     const voiceProvider = sessionData?.interviewPlan?.realtime?.voiceProvider;
-    return aiOutputMode !== 'openai_stream' && voiceProvider === 'groq_browser';
-  }, [aiOutputMode, sessionData?.interviewPlan?.realtime?.voiceProvider]);
+    return voiceProvider === 'groq_browser';
+  }, [sessionData?.interviewPlan?.realtime?.voiceProvider]);
+  const useGroqVoiceMode = useMemo(() => {
+    return usesGroqPlan;
+  }, [usesGroqPlan]);
 
-  const speakText = useCallback((text) => {
+  const groqAutoFlowStatus = useMemo(() => {
+    if (!useGroqVoiceMode) {
+      return null;
+    }
+
+    if (submittingGroqTurn || loadingGroqQuestion) {
+      return 'submitting';
+    }
+
+    if (speakingAiResponse) {
+      return 'speaking';
+    }
+
+    if (capturingVoiceAnswer) {
+      return 'listening';
+    }
+
+    return 'waiting';
+  }, [capturingVoiceAnswer, loadingGroqQuestion, speakingAiResponse, submittingGroqTurn, useGroqVoiceMode]);
+
+  const groqAutoFlowStatusText = useMemo(() => {
+    if (!groqAutoFlowStatus) {
+      return '';
+    }
+
+    if (groqAutoFlowStatus === 'listening') {
+      return 'Listening: capturing your answer now.';
+    }
+
+    if (groqAutoFlowStatus === 'submitting') {
+      return 'Submitting: sending your answer and fetching the next question.';
+    }
+
+    if (groqAutoFlowStatus === 'speaking') {
+      return 'Speaking: AI interviewer is reading the next question.';
+    }
+
+    return awaitingCandidateReply
+      ? 'Waiting: ready for your response.'
+      : 'Waiting: preparing the next interview step.';
+  }, [awaitingCandidateReply, groqAutoFlowStatus]);
+
+  const formatDebugTime = useCallback((value) => {
+    if (!value) {
+      return '--';
+    }
+
+    try {
+      return new Date(value).toLocaleTimeString();
+    } catch (_error) {
+      return '--';
+    }
+  }, []);
+
+  const speakText = useCallback((text, options = {}) => {
     const normalized = normalizeTranscriptText(text);
     if (!normalized || !window.speechSynthesis) {
+      setSpeakingAiResponse(false);
+      if (typeof options.onEnd === 'function') {
+        options.onEnd();
+      }
       return;
     }
     const utterance = new SpeechSynthesisUtterance(normalized);
     utterance.rate = 1;
     utterance.pitch = 1;
+    utterance.onstart = () => {
+      setSpeakingAiResponse(true);
+    };
+    utterance.onend = () => {
+      setSpeakingAiResponse(false);
+      setGroqDebugTimestamps((prev) => ({ ...prev, lastSpeakEnd: new Date().toISOString() }));
+      if (typeof options.onEnd === 'function') {
+        options.onEnd();
+      }
+    };
+    utterance.onerror = () => {
+      setSpeakingAiResponse(false);
+      setGroqDebugTimestamps((prev) => ({ ...prev, lastSpeakEnd: new Date().toISOString() }));
+      if (typeof options.onEnd === 'function') {
+        options.onEnd();
+      }
+    };
+    setSpeakingAiResponse(false);
     window.speechSynthesis.cancel();
     window.speechSynthesis.speak(utterance);
   }, []);
@@ -174,7 +264,11 @@ export default function Interview() {
     }
   }, []);
 
-  const stopVoiceAnswerCapture = useCallback((reason = 'manual') => {
+  const stopVoiceAnswerCapture = useCallback((reason = 'manual', options = {}) => {
+    if (options.skipSubmit) {
+      skipNextSpeechSubmitRef.current = true;
+    }
+
     clearSpeechSilenceTimer();
 
     if (speechRecognitionRef.current) {
@@ -210,6 +304,7 @@ export default function Interview() {
     return () => {
       clearSpeechSilenceTimer();
       if (speechRecognitionRef.current) {
+        skipNextSpeechSubmitRef.current = true;
         try {
           speechRecognitionRef.current.stop();
         } catch (_error) {
@@ -491,20 +586,69 @@ export default function Interview() {
     }
   }, [cleanupRealtimeTransport, completing, handleRealtimeEvent, sendRealtimeFollowupPrompt, sessionData?.session?.id, terminating]);
 
-  const requestGroqNextQuestion = useCallback(async () => {
-    if (!sessionData?.session?.id || loadingGroqQuestion || sessionFinalizedRef.current) {
+  const requestGroqNextQuestion = useCallback(async ({ candidateText = '' } = {}) => {
+    if (!sessionData?.session?.id || loadingGroqQuestion || sessionFinalizedRef.current || groqTurnInFlightRef.current) {
       return;
     }
 
     try {
+      groqTurnInFlightRef.current = true;
+      setSubmittingGroqTurn(true);
+      setGroqDebugTimestamps((prev) => ({ ...prev, lastSubmit: new Date().toISOString() }));
       setLoadingGroqQuestion(true);
+      const normalizedCandidateText = normalizeTranscriptText(candidateText);
+      let payloadTurns = transcriptTurnsRef.current;
+
+      if (normalizedCandidateText) {
+        const candidateTurnId = `candidate-groq-${Math.max(questionsAskedRef.current, 1)}`;
+        const candidateTurn = {
+          id: candidateTurnId,
+          speaker: 'candidate',
+          text: normalizedCandidateText,
+          timestamp: new Date().toISOString(),
+        };
+
+        const existingIndex = payloadTurns.findIndex((turn) => turn?.id === candidateTurnId);
+        const nextTurns = [...payloadTurns];
+        if (existingIndex === -1) {
+          nextTurns.push(candidateTurn);
+        } else {
+          nextTurns[existingIndex] = candidateTurn;
+        }
+
+        payloadTurns = nextTurns;
+        transcriptTurnsRef.current = nextTurns;
+        setTranscriptTurns(nextTurns);
+      }
+
       const response = await api.post(`/candidate/interview-session/${sessionData.session.id}/next-question`, {
-        transcriptTurns: transcriptTurnsRef.current,
+        transcriptTurns: payloadTurns,
         questionsAsked: questionsAskedRef.current,
       });
 
       const payload = response.data || {};
+      const serverTranscriptVersion = Number.isInteger(payload.transcriptVersion)
+        ? payload.transcriptVersion
+        : null;
+      if (serverTranscriptVersion !== null) {
+        lastAppliedTranscriptVersionRef.current = Math.max(lastAppliedTranscriptVersionRef.current, serverTranscriptVersion);
+        lastRequestedTranscriptVersionRef.current = Math.max(lastRequestedTranscriptVersionRef.current, serverTranscriptVersion);
+      }
+
       if (payload.completed) {
+        if (payload.autoCompleted) {
+          sessionFinalizedRef.current = true;
+          clearInterviewLock();
+          await exitFullscreenSafely();
+          if (payload.scoringStatus === 'pending') {
+            toast.success('Interview completed. Scoring is queued and will appear shortly.');
+          } else {
+            toast.success('Interview completed and scoring has started.');
+          }
+          navigate('/candidate', { replace: true });
+          return;
+        }
+
         if (!autoCompletingRef.current) {
           autoCompletingRef.current = true;
           setInterviewCompleteReason('question_limit_reached');
@@ -524,13 +668,42 @@ export default function Interview() {
       setQuestionsAsked(questionNumber);
       setAwaitingCandidateReply(true);
       appendRealtimeTurn('ai', questionText, `ai-next-${questionNumber}`);
-      speakText(questionText);
+      speakText(questionText, {
+        onEnd: () => {
+          if (
+            !useGroqVoiceMode ||
+            sessionFinalizedRef.current ||
+            groqTurnInFlightRef.current ||
+            completing ||
+            terminating
+          ) {
+            return;
+          }
+
+          window.setTimeout(() => {
+            startVoiceAnswerCaptureRef.current?.();
+          }, 200);
+        },
+      });
     } catch (error) {
       toast.error(error?.message || 'Unable to get next interview question');
     } finally {
       setLoadingGroqQuestion(false);
+      setSubmittingGroqTurn(false);
+      groqTurnInFlightRef.current = false;
     }
-  }, [appendRealtimeTurn, loadingGroqQuestion, sessionData?.session?.id, speakText]);
+  }, [
+    appendRealtimeTurn,
+    clearInterviewLock,
+    completing,
+    exitFullscreenSafely,
+    loadingGroqQuestion,
+    navigate,
+    sessionData?.session?.id,
+    speakText,
+    terminating,
+    useGroqVoiceMode,
+  ]);
 
   const terminateInterview = useCallback(
     async (reason) => {
@@ -603,6 +776,14 @@ export default function Interview() {
         }
 
         if (verifiedSession.status === 'in_progress') {
+          const persistedTranscriptTurns = Array.isArray(sessionCheck.data?.transcriptTurns)
+            ? sessionCheck.data.transcriptTurns
+            : [];
+          const persistedTranscriptVersion = Number.isInteger(sessionCheck.data?.transcriptVersion)
+            ? sessionCheck.data.transcriptVersion
+            : 0;
+          const inferredQuestionsAsked = persistedTranscriptTurns.filter((turn) => turn?.speaker === 'ai').length;
+
           setSessionData({
             session: verifiedSession,
             interviewRole: sessionCheck.data?.interviewRole || latestSession?.interview_role || plan?.role || 'General Candidate',
@@ -610,12 +791,24 @@ export default function Interview() {
             interviewPlan: sessionCheck.data?.interviewPlan || plan,
             resumeSummary: sessionCheck.data?.resumeSummary || latestSession?.resume_summary || '',
           });
-          setAiOutputMode(resolveAiOutputMode(sessionCheck.data?.aiOutputMode || DEFAULT_AI_OUTPUT_MODE));
+          const nextAiOutputMode = resolveAiOutputMode(sessionCheck.data?.aiOutputMode || DEFAULT_AI_OUTPUT_MODE);
+          const resumedVoiceProvider = sessionCheck.data?.interviewPlan?.realtime?.voiceProvider || plan?.realtime?.voiceProvider;
+          setAiOutputMode(resumedVoiceProvider === 'groq_browser' ? 'browser_tts' : nextAiOutputMode);
           setInterviewRole(sessionCheck.data?.interviewRole || latestSession?.interview_role || plan?.role || 'General Candidate');
           if (sessionCheck.data?.interviewPlan) {
             setInterviewPlan(sessionCheck.data.interviewPlan);
           }
           setResumeSummary(sessionCheck.data?.resumeSummary || latestSession?.resume_summary || '');
+          setTranscriptTurns(persistedTranscriptTurns);
+          lastAutosavedTranscriptRef.current = buildTranscriptFromTurns(persistedTranscriptTurns);
+          lastRequestedTranscriptVersionRef.current = persistedTranscriptVersion;
+          lastAppliedTranscriptVersionRef.current = persistedTranscriptVersion;
+          setQuestionsAsked(inferredQuestionsAsked);
+          questionsAskedRef.current = inferredQuestionsAsked;
+          const latestTurn = persistedTranscriptTurns[persistedTranscriptTurns.length - 1];
+          const awaitingReply = Boolean(latestTurn && latestTurn.speaker === 'ai');
+          setAwaitingCandidateReply(awaitingReply);
+          awaitingCandidateReplyRef.current = awaitingReply;
           // Keep consent gate state as-is to avoid bouncing back while live room initializes.
           startInterviewLock(verifiedSession.id);
         } else {
@@ -651,7 +844,9 @@ export default function Interview() {
       });
 
       setSessionData(response.data);
-      setAiOutputMode(resolveAiOutputMode(response.data?.aiOutputMode || DEFAULT_AI_OUTPUT_MODE));
+      const startedAiOutputMode = resolveAiOutputMode(response.data?.aiOutputMode || DEFAULT_AI_OUTPUT_MODE);
+      const startedVoiceProvider = response.data?.interviewPlan?.realtime?.voiceProvider;
+      setAiOutputMode(startedVoiceProvider === 'groq_browser' ? 'browser_tts' : startedAiOutputMode);
       setInterviewRole(response.data?.interviewRole || 'General Candidate');
       setInterviewPlan(response.data?.interviewPlan ?? null);
       setResumeSummary(response.data?.resumeSummary || '');
@@ -769,8 +964,17 @@ export default function Interview() {
         questionsAskedRef.current = 0;
         awaitingCandidateReplyRef.current = false;
         autoCompletingRef.current = false;
+        groqTurnInFlightRef.current = false;
+        groqAutoKickoffDoneRef.current = false;
         speechFinalBufferRef.current = '';
-        stopVoiceAnswerCapture();
+        setSubmittingGroqTurn(false);
+        setSpeakingAiResponse(false);
+        setGroqDebugTimestamps({
+          lastListenStart: null,
+          lastSubmit: null,
+          lastSpeakEnd: null,
+        });
+        stopVoiceAnswerCapture('manual', { skipSubmit: true });
         setQuestionsAsked(0);
         setAwaitingCandidateReply(false);
         setInterviewCompleteReason('');
@@ -806,7 +1010,7 @@ export default function Interview() {
 
   useEffect(() => {
     if (!useGroqVoiceMode && capturingVoiceAnswer) {
-      stopVoiceAnswerCapture();
+      stopVoiceAnswerCapture('manual', { skipSubmit: true });
     }
   }, [capturingVoiceAnswer, stopVoiceAnswerCapture, useGroqVoiceMode]);
 
@@ -827,7 +1031,7 @@ export default function Interview() {
       return;
     }
 
-    if (aiOutputMode !== 'openai_stream') {
+    if (useGroqVoiceMode || aiOutputMode !== 'openai_stream') {
       cleanupRealtimeTransport();
       setRealtimeStatus('idle');
       return;
@@ -841,6 +1045,7 @@ export default function Interview() {
     hasAcknowledgedNotice,
     sessionData?.session?.id,
     startRealtimeTransport,
+    useGroqVoiceMode,
   ]);
 
   useEffect(() => {
@@ -849,7 +1054,8 @@ export default function Interview() {
     }
 
     if (useGroqVoiceMode) {
-      if (questionsAskedRef.current === 0 && !loadingGroqQuestion) {
+      if (!groqAutoKickoffDoneRef.current && questionsAskedRef.current === 0 && !loadingGroqQuestion) {
+        groqAutoKickoffDoneRef.current = true;
         void requestGroqNextQuestion();
       }
       return;
@@ -930,6 +1136,16 @@ export default function Interview() {
       return;
     }
 
+    if (
+      capturingVoiceAnswer ||
+      loadingGroqQuestion ||
+      groqTurnInFlightRef.current ||
+      !awaitingCandidateReplyRef.current ||
+      sessionFinalizedRef.current
+    ) {
+      return;
+    }
+
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (typeof SpeechRecognition !== 'function') {
       toast.error('Voice recognition is not supported in this browser.');
@@ -988,11 +1204,40 @@ export default function Interview() {
       clearSpeechSilenceTimer();
       setCapturingVoiceAnswer(false);
       speechRecognitionRef.current = null;
+
+      const skipSubmit = skipNextSpeechSubmitRef.current;
+      skipNextSpeechSubmitRef.current = false;
+      const finalizedText = normalizeTranscriptText(speechFinalBufferRef.current);
+      speechFinalBufferRef.current = '';
+
+      if (
+        skipSubmit ||
+        !useGroqVoiceMode ||
+        !awaitingCandidateReplyRef.current ||
+        !finalizedText ||
+        sessionFinalizedRef.current ||
+        groqTurnInFlightRef.current
+      ) {
+        return;
+      }
+
+      if (questionsAskedRef.current >= maxRealtimeQuestions) {
+        setAwaitingCandidateReply(false);
+        if (!autoCompletingRef.current) {
+          autoCompletingRef.current = true;
+          setInterviewCompleteReason('question_limit_reached');
+        }
+        return;
+      }
+
+      setAwaitingCandidateReply(false);
+      void requestGroqNextQuestion({ candidateText: finalizedText });
     };
 
     try {
       speechRecognitionRef.current = recognition;
       recognition.start();
+      setGroqDebugTimestamps((prev) => ({ ...prev, lastListenStart: new Date().toISOString() }));
       resetSilenceAutoStop();
       setCapturingVoiceAnswer(true);
     } catch (_error) {
@@ -1006,7 +1251,15 @@ export default function Interview() {
     responses,
     stopVoiceAnswerCapture,
     useGroqVoiceMode,
+    capturingVoiceAnswer,
+    loadingGroqQuestion,
+    maxRealtimeQuestions,
+    requestGroqNextQuestion,
   ]);
+
+  useEffect(() => {
+    startVoiceAnswerCaptureRef.current = startVoiceAnswerCapture;
+  }, [startVoiceAnswerCapture]);
 
   useEffect(() => {
     if (!sessionData?.session?.id || !hasAcknowledgedNotice || sessionFinalizedRef.current) {
@@ -1076,28 +1329,6 @@ export default function Interview() {
   }, [hasAcknowledgedNotice, sessionData?.session?.id]);
 
   const onNextQuestion = () => {
-    if (useGroqVoiceMode) {
-      if (capturingVoiceAnswer) {
-        stopVoiceAnswerCapture();
-      }
-
-      if (questionsAsked >= maxRealtimeQuestions) {
-        setInterviewCompleteReason('question_limit_reached');
-        return;
-      }
-
-      const responseIndex = Math.max(questionsAsked - 1, 0);
-      const typedAnswer = normalizeTranscriptText(responses[responseIndex] || '');
-      if (!typedAnswer) {
-        toast.error('Please provide your answer before moving to the next question.');
-        return;
-      }
-
-      setAwaitingCandidateReply(false);
-      void requestGroqNextQuestion();
-      return;
-    }
-
     if (aiOutputMode === 'openai_stream' && realtimeConnectedRef.current) {
       const sent = sendRealtimeFollowupPrompt('followup');
       if (!sent) {
@@ -1111,6 +1342,54 @@ export default function Interview() {
     }
   };
 
+  const submitTypedGroqAnswer = useCallback(() => {
+    if (!useGroqVoiceMode || !sessionData?.session?.id) {
+      return;
+    }
+
+    if (submittingGroqTurn || loadingGroqQuestion || groqTurnInFlightRef.current) {
+      return;
+    }
+
+    if (!awaitingCandidateReplyRef.current) {
+      toast('Wait for the AI interviewer question before submitting your response.');
+      return;
+    }
+
+    const responseIndex = Math.max(questionsAskedRef.current - 1, 0);
+    const typedAnswer = normalizeTranscriptText(responses[responseIndex] || '');
+    if (!typedAnswer) {
+      toast.error('Please type your response before submitting.');
+      return;
+    }
+
+    if (capturingVoiceAnswer) {
+      stopVoiceAnswerCapture('manual', { skipSubmit: true });
+    }
+
+    if (questionsAskedRef.current >= maxRealtimeQuestions) {
+      setAwaitingCandidateReply(false);
+      if (!autoCompletingRef.current) {
+        autoCompletingRef.current = true;
+        setInterviewCompleteReason('question_limit_reached');
+      }
+      return;
+    }
+
+    setAwaitingCandidateReply(false);
+    void requestGroqNextQuestion({ candidateText: typedAnswer });
+  }, [
+    capturingVoiceAnswer,
+    loadingGroqQuestion,
+    maxRealtimeQuestions,
+    requestGroqNextQuestion,
+    responses,
+    sessionData?.session?.id,
+    stopVoiceAnswerCapture,
+    submittingGroqTurn,
+    useGroqVoiceMode,
+  ]);
+
   const onEndInterview = useCallback(async (completionReason = 'manual_end') => {
     const safeCompletionReason = typeof completionReason === 'string' ? completionReason : 'manual_end';
 
@@ -1123,7 +1402,7 @@ export default function Interview() {
       setCompleting(true);
       cleanupRealtimeTransport();
       if (capturingVoiceAnswer) {
-        stopVoiceAnswerCapture();
+        stopVoiceAnswerCapture('manual', { skipSubmit: true });
       }
 
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
@@ -1146,32 +1425,79 @@ export default function Interview() {
         .join('\n\n');
       const transcriptText = transcriptSnapshot || fallbackTranscriptText;
 
-      await api.post(`/candidate/interview-session/${sessionId}/complete`, {
-        transcript: transcriptText,
-        durationSeconds: elapsedSeconds,
-        videoPath: storedVideoPath,
-        videoUploadNonce,
-        videoUrl: null,
-        scorePayload: {
-          role: sessionData?.interviewRole,
-          completionReason: safeCompletionReason,
-          questionsAsked,
-          maxQuestions: maxRealtimeQuestions,
-          transcriptTurns,
+      const completionResponse = await api.post(
+        `/candidate/interview-session/${sessionId}/complete`,
+        {
+          transcript: transcriptText,
+          durationSeconds: elapsedSeconds,
+          videoPath: storedVideoPath,
+          videoUploadNonce,
+          videoUrl: null,
+          scorePayload: {
+            role: sessionData?.interviewRole,
+            completionReason: safeCompletionReason,
+            questionsAsked,
+            maxQuestions: maxRealtimeQuestions,
+            transcriptTurns,
+          },
         },
-      });
+        {
+          timeout: 90000,
+        },
+      );
 
       sessionFinalizedRef.current = true;
       clearInterviewLock();
       await exitFullscreenSafely();
-      toast.success(
-        safeCompletionReason === 'question_limit_reached'
-          ? 'Interview completed after the planned number of questions'
-          : 'Interview completed and submitted',
-      );
+      const scoringStatus = completionResponse?.data?.scoringStatus;
+      if (scoringStatus === 'pending') {
+        toast.success('Interview submitted. Scoring is queued and will be available shortly.');
+      } else {
+        toast.success(
+          safeCompletionReason === 'question_limit_reached'
+            ? 'Interview completed after the planned number of questions'
+            : 'Interview completed and submitted',
+        );
+      }
       navigate('/candidate', { replace: true });
     } catch (error) {
-      toast.error(error.message || 'Unable to complete interview session');
+      const message = error?.message || 'Unable to complete interview session';
+      const normalized = message.toLowerCase();
+      const isAlreadyFinalizedError =
+        normalized.includes('not in progress') ||
+        normalized.includes('already finalized') ||
+        normalized.includes('already completed') ||
+        normalized.includes('409');
+
+      if (isAlreadyFinalizedError) {
+        sessionFinalizedRef.current = true;
+        clearInterviewLock();
+        await exitFullscreenSafely();
+        toast.success('Interview is already finalized. Redirecting to dashboard.');
+        navigate('/candidate', { replace: true });
+        return;
+      }
+
+      if (normalized.includes('408 timeout')) {
+        try {
+          const statusResponse = await api.get(`/candidate/interview-session/${sessionData.session.id}`, {
+            timeout: 20000,
+          });
+          const currentStatus = statusResponse?.data?.session?.status;
+          if (currentStatus === 'completed') {
+            sessionFinalizedRef.current = true;
+            clearInterviewLock();
+            await exitFullscreenSafely();
+            toast.success('Interview completion is still processing. Redirecting to dashboard.');
+            navigate('/candidate', { replace: true });
+            return;
+          }
+        } catch (_statusError) {
+          // Fall through to default timeout message.
+        }
+      }
+
+      toast.error(message || 'Unable to complete interview session');
     } finally {
       setCompleting(false);
     }
@@ -1312,33 +1638,52 @@ export default function Interview() {
           </div>
 
           {(aiOutputMode !== 'openai_stream' || realtimeStatus === 'fallback') && activeQuestion && (
-            <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                {useGroqVoiceMode ? `Question ${questionsAsked || 1} of ${maxRealtimeQuestions}` : `Question ${activeQuestionIndex + 1} of ${questions.length}`}
-              </p>
-              <p className="mt-2 text-sm font-semibold text-slate-900">
-                {useGroqVoiceMode ? (transcriptTurns.filter((turn) => turn.speaker === 'ai').slice(-1)[0]?.text || 'Loading interview question...') : activeQuestion}
-              </p>
-              <textarea
-                className="mt-3 h-24 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 outline-none focus:border-teal-500"
-                value={responses[useGroqVoiceMode ? Math.max(questionsAsked - 1, 0) : activeQuestionIndex] || ''}
-                onChange={(event) => onAnswerChange(event.target.value)}
-                placeholder="Type candidate response transcript notes here..."
-              />
+            <div className="mt-4 rounded-xl border-2 border-teal-500 bg-gradient-to-br from-teal-50 to-cyan-50 p-4 shadow-md">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs font-bold uppercase tracking-widest text-teal-700">
+                  ✨ Question {useGroqVoiceMode ? questionsAsked || 1 : activeQuestionIndex + 1} of {useGroqVoiceMode ? maxRealtimeQuestions : questions.length}
+                </p>
+                <span className="inline-block bg-teal-600 text-white text-xs font-bold px-2 py-1 rounded">Your Turn</span>
+              </div>
+              <div className="bg-white rounded-lg p-3 mb-3 border border-teal-200">
+                <p className="text-sm font-semibold text-slate-900 leading-relaxed">
+                  {useGroqVoiceMode ? (transcriptTurns.filter((turn) => turn.speaker === 'ai').slice(-1)[0]?.text || 'Loading interview question...') : activeQuestion}
+                </p>
+              </div>
+              <div className="space-y-2">
+                <p className="text-xs text-teal-700 font-semibold">Share Your Response:</p>
+                <textarea
+                  className="w-full rounded-lg border-2 border-teal-300 px-3 py-2 text-sm text-slate-900 outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-200 placeholder-slate-400"
+                  value={responses[useGroqVoiceMode ? Math.max(questionsAsked - 1, 0) : activeQuestionIndex] || ''}
+                  onChange={(event) => onAnswerChange(event.target.value)}
+                  placeholder="Type your detailed response here or use voice capture..."
+                  rows={3}
+                />
+              </div>
               {useGroqVoiceMode ? (
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Button
                     type="button"
-                    variant="secondary"
+                    variant={capturingVoiceAnswer ? 'primary' : 'secondary'}
                     onClick={capturingVoiceAnswer ? stopVoiceAnswerCapture : startVoiceAnswerCapture}
                     disabled={!speechRecognitionSupported}
-                    className="gap-1.5"
+                    className={`gap-1.5 ${capturingVoiceAnswer ? 'bg-red-600 hover:bg-red-700' : ''}`}
                   >
                     <Mic size={16} />
-                    {capturingVoiceAnswer ? 'Stop Voice Answer' : 'Start Voice Answer'}
+                    {capturingVoiceAnswer ? '🔴 Stop Recording' : '🎤 Start Voice Capture'}
                   </Button>
                   {!speechRecognitionSupported ? (
-                    <p className="text-xs text-amber-700">Speech recognition not available in this browser.</p>
+                    <>
+                      <p className="text-xs text-amber-700">Speech recognition not available in this browser. Use typed submit.</p>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        onClick={submitTypedGroqAnswer}
+                        disabled={submittingGroqTurn || loadingGroqQuestion || !awaitingCandidateReply}
+                      >
+                        {submittingGroqTurn || loadingGroqQuestion ? 'Submitting...' : 'Submit Typed Response'}
+                      </Button>
+                    </>
                   ) : (
                     <p className="text-xs text-slate-500">Voice capture auto-stops after about 2.5s of silence.</p>
                   )}
@@ -1359,48 +1704,95 @@ export default function Interview() {
                 {awaitingCandidateReply
                   ? 'AI is waiting for your response.'
                   : useGroqVoiceMode
-                    ? 'Click next to fetch the next coding question.'
+                    ? 'The next coding question is fetched automatically after your voice response.'
                     : 'AI will ask the next question automatically.'}
               </p>
+              {useGroqVoiceMode ? (
+                <div className="mt-3 rounded-lg border border-teal-200 bg-teal-50 px-3 py-2">
+                  <p className="text-[11px] font-semibold uppercase tracking-wide text-teal-700">
+                    Auto-flow status: {groqAutoFlowStatus}
+                  </p>
+                  <p className="mt-1 text-xs text-teal-800">{groqAutoFlowStatusText}</p>
+                  <p className="mt-1 text-[11px] text-teal-700/90">
+                    listen {formatDebugTime(groqDebugTimestamps.lastListenStart)} | submit {formatDebugTime(groqDebugTimestamps.lastSubmit)} | speak-end {formatDebugTime(groqDebugTimestamps.lastSpeakEnd)}
+                  </p>
+                </div>
+              ) : null}
             </div>
           ) : null}
 
           <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4">
-            <div className="mb-2 flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Live transcript</p>
-              {autosavingTranscript ? <p className="text-xs text-teal-700">Autosaving...</p> : null}
+            <div className="mb-3 flex items-center justify-between">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">💬 Conversation</p>
+              {autosavingTranscript ? <p className="text-xs text-teal-600">Saving...</p> : null}
             </div>
-            <div className="max-h-40 overflow-y-auto rounded-lg bg-slate-50 p-3 text-xs text-slate-700">
+            <div className="max-h-48 overflow-y-auto rounded-lg bg-gradient-to-b from-slate-50 to-slate-100 p-4 space-y-3">
               {transcriptTurns.length ? (
-                transcriptTurns.map((turn) => (
-                  <p key={turn.id} className="mb-1 last:mb-0">
-                    <span className="font-semibold">{turn.speaker === 'ai' ? 'AI' : 'Candidate'}:</span> {turn.text || '(typing...)'}
-                  </p>
-                ))
+                <>
+                  {transcriptTurns.map((turn, index) => {
+                    const isAI = turn.speaker === 'ai';
+                    return (
+                      <motion.div
+                        key={turn.id}
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: index * 0.05 }}
+                        className={`flex ${isAI ? 'justify-start' : 'justify-end'}`}
+                      >
+                        <div
+                          className={`max-w-[85%] rounded-lg px-3 py-2 text-sm ${
+                            isAI
+                              ? 'bg-white text-slate-800 border border-slate-200 shadow-sm'
+                              : 'bg-teal-600 text-white shadow-md'
+                          }`}
+                        >
+                          <p className="text-xs font-semibold mb-1 opacity-75">
+                            {isAI ? '🤖 AI Interviewer' : '👤 You'}
+                          </p>
+                          <p className="leading-relaxed">{turn.text || '(typing...)'}</p>
+                        </div>
+                      </motion.div>
+                    );
+                  })}
+                  {loadingGroqQuestion && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="flex justify-start"
+                    >
+                      <div className="bg-white text-slate-600 rounded-lg px-3 py-2 text-sm border border-slate-200 shadow-sm">
+                        <p className="text-xs font-semibold mb-1 opacity-75">🤖 AI Interviewer</p>
+                        <div className="flex gap-1.5">
+                          <span className="w-2 h-2 bg-slate-400 rounded-full animate-bounce"></span>
+                          <span className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></span>
+                          <span className="w-2 h-2 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></span>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </>
               ) : (
-                <p>No transcript entries yet.</p>
+                <p className="text-sm text-slate-500 text-center py-6">
+                  No conversation yet. Start the interview to begin.
+                </p>
               )}
             </div>
           </div>
 
           <div className="mt-4 flex flex-wrap gap-2">
-            <Button
-              variant="secondary"
-              onClick={onNextQuestion}
-              disabled={
-                aiOutputMode === 'openai_stream'
-                  ? realtimeStatus === 'connecting' || questionsAsked >= maxRealtimeQuestions
-                  : useGroqVoiceMode
-                    ? loadingGroqQuestion || questionsAsked >= maxRealtimeQuestions
+            {!useGroqVoiceMode ? (
+              <Button
+                variant="secondary"
+                onClick={onNextQuestion}
+                disabled={
+                  aiOutputMode === 'openai_stream'
+                    ? realtimeStatus === 'connecting' || questionsAsked >= maxRealtimeQuestions
                     : activeQuestionIndex >= questions.length - 1
-              }
-            >
-              {aiOutputMode === 'openai_stream'
-                ? 'Force Next Follow-up'
-                : useGroqVoiceMode
-                  ? (loadingGroqQuestion ? 'Loading...' : 'Next Coding Question')
-                  : 'Next Question'}
-            </Button>
+                }
+              >
+                {aiOutputMode === 'openai_stream' ? 'Force Next Follow-up' : 'Next Question'}
+              </Button>
+            ) : null}
             <Button onClick={onEndInterview} disabled={connecting || completing || terminating} className="gap-1.5">
               <PhoneOff size={16} /> {completing ? 'Submitting...' : 'End Interview'}
             </Button>

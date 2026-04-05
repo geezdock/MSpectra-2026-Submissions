@@ -1,7 +1,6 @@
 import React from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { motion } from 'framer-motion';
 import { Search, Star, X } from 'lucide-react';
 import toast from 'react-hot-toast';
 import Card from '../../components/ui/Card';
@@ -32,6 +31,34 @@ export default function AdminDashboard() {
   const [searchApplying, setSearchApplying] = useState(false);
   const [bulkApplying, setBulkApplying] = useState(false);
   const [bulkJob, setBulkJob] = useState(null);
+  const [staleLimit, setStaleLimit] = useState(100);
+  const [staleIdleMinutes, setStaleIdleMinutes] = useState(30);
+  const [staleRunInBackground, setStaleRunInBackground] = useState(true);
+  const [staleApplying, setStaleApplying] = useState(false);
+  const [staleJob, setStaleJob] = useState(null);
+  const [staleLastResult, setStaleLastResult] = useState(null);
+
+  const fetchCandidates = useCallback(async () => {
+    try {
+      setSearchApplying(true);
+      const params = new URLSearchParams();
+      if (query.trim()) params.append('search', query);
+      if (selectedStage) params.append('stage', selectedStage);
+
+      const url = `/admin/candidates${params.toString() ? `?${params.toString()}` : ''}`;
+      const response = await api.get(url);
+      setCandidates(response.data?.candidates ?? []);
+      setCurrentPage(1);
+      setSelectedCandidateIds([]);
+      setLoadError('');
+    } catch (error) {
+      setCandidates([]);
+      setLoadError(error.message || 'Unable to load candidates.');
+    } finally {
+      setLoading(false);
+      setSearchApplying(false);
+    }
+  }, [query, selectedStage]);
 
   useEffect(() => {
     if (!bulkJob?.id || !['queued', 'running'].includes(bulkJob.status)) {
@@ -71,33 +98,46 @@ export default function AdminDashboard() {
     }, 1500);
 
     return () => window.clearInterval(intervalId);
-  }, [bulkJob?.id, bulkJob?.status]);
+  }, [bulkJob?.id, bulkJob?.status, fetchCandidates]);
 
-  const fetchCandidates = async () => {
-    try {
-      setSearchApplying(true);
-      const params = new URLSearchParams();
-      if (query.trim()) params.append('search', query);
-      if (selectedStage) params.append('stage', selectedStage);
-
-      const url = `/admin/candidates${params.toString() ? `?${params.toString()}` : ''}`;
-      const response = await api.get(url);
-      setCandidates(response.data?.candidates ?? []);
-      setCurrentPage(1);
-      setSelectedCandidateIds([]);
-      setLoadError('');
-    } catch (error) {
-      setCandidates([]);
-      setLoadError(error.message || 'Unable to load candidates.');
-    } finally {
-      setLoading(false);
-      setSearchApplying(false);
+  useEffect(() => {
+    if (!staleJob?.id || !['queued', 'running'].includes(staleJob.status)) {
+      return undefined;
     }
-  };
+
+    const intervalId = window.setInterval(async () => {
+      try {
+        const response = await api.get(`/admin/background-jobs/${staleJob.id}`);
+        const job = response.data;
+        setStaleJob(job);
+
+        if (job.status === 'completed') {
+          window.clearInterval(intervalId);
+          setStaleApplying(false);
+          setStaleLastResult(job.result || null);
+          toast.success('Stale session auto-complete finished');
+          await fetchCandidates();
+        }
+
+        if (job.status === 'failed') {
+          window.clearInterval(intervalId);
+          setStaleApplying(false);
+          toast.error(job.error || 'Stale session auto-complete failed');
+        }
+      } catch (error) {
+        window.clearInterval(intervalId);
+        setStaleApplying(false);
+        setStaleJob(null);
+        toast.error(error.message || 'Unable to fetch stale-session job status');
+      }
+    }, 1500);
+
+    return () => window.clearInterval(intervalId);
+  }, [staleJob?.id, staleJob?.status, fetchCandidates]);
 
   useEffect(() => {
     fetchCandidates();
-  }, []);
+  }, [fetchCandidates]);
 
   const handleSearch = async () => {
     setCandidates([]);
@@ -173,6 +213,38 @@ export default function AdminDashboard() {
     }
   };
 
+  const handleAutoCompleteStaleSessions = async () => {
+    const safeLimit = Math.max(1, Math.min(500, Number(staleLimit) || 1));
+    const safeIdleMinutes = Math.max(5, Math.min(24 * 60, Number(staleIdleMinutes) || 30));
+
+    setStaleApplying(true);
+    setStaleLastResult(null);
+
+    try {
+      const response = await api.post('/admin/interview-sessions/auto-complete-stale', {
+        limit: safeLimit,
+        idleMinutes: safeIdleMinutes,
+        runInBackground: staleRunInBackground,
+      });
+
+      if (staleRunInBackground) {
+        setStaleJob(response.data || null);
+        toast.success('Stale session auto-complete queued');
+        return;
+      }
+
+      setStaleJob(null);
+      setStaleLastResult(response.data || null);
+      setStaleApplying(false);
+      await fetchCandidates();
+      toast.success('Stale session auto-complete finished');
+    } catch (error) {
+      setStaleApplying(false);
+      setStaleJob(null);
+      toast.error(error.message || 'Unable to auto-complete stale sessions');
+    }
+  };
+
   const hasActiveFilters = query || selectedStage;
 
   const sortedCandidates = useMemo(() => {
@@ -201,10 +273,10 @@ export default function AdminDashboard() {
 
   return (
     <div className="space-y-6">
-      <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
+      <div>
         <h1 className="text-3xl font-black text-slate-900">Admin Dashboard</h1>
         <p className="mt-2 text-slate-600">Search, filter, review, and prioritize candidates.</p>
-      </motion.div>
+      </div>
 
       <Card>
         {loadError ? (
@@ -363,6 +435,77 @@ export default function AdminDashboard() {
                   <p className="mt-2 text-xs text-slate-600">
                     {bulkJob.progress?.processed || 0} / {bulkJob.progress?.total || bulkJob.context?.candidateCount || 0} processed
                   </p>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+              <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Interview Reliability</p>
+                  <p className="text-xs text-slate-500">Auto-complete stale in-progress interviews for operational recovery.</p>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-4 md:w-auto">
+                  <div>
+                    <label className="mb-1 block text-xs font-semibold text-slate-700">Limit</label>
+                    <Input
+                      type="number"
+                      min={1}
+                      max={500}
+                      value={staleLimit}
+                      onChange={(event) => setStaleLimit(event.target.value)}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-xs font-semibold text-slate-700">Idle Minutes</label>
+                    <Input
+                      type="number"
+                      min={5}
+                      max={1440}
+                      value={staleIdleMinutes}
+                      onChange={(event) => setStaleIdleMinutes(event.target.value)}
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-xs font-semibold text-slate-700">Run Mode</label>
+                    <select
+                      value={staleRunInBackground ? 'background' : 'sync'}
+                      onChange={(event) => setStaleRunInBackground(event.target.value === 'background')}
+                      className="block h-11 w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-opacity-30"
+                    >
+                      <option value="background">Background</option>
+                      <option value="sync">Sync</option>
+                    </select>
+                  </div>
+
+                  <div className="flex items-end">
+                    <Button onClick={handleAutoCompleteStaleSessions} disabled={staleApplying} className="w-full">
+                      {staleApplying ? 'Running...' : 'Auto-Complete Stale'}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              {staleJob ? (
+                <div className="mt-4 rounded-lg border border-indigo-200 bg-white p-3">
+                  <div className="mb-1 flex items-center justify-between text-xs font-semibold text-indigo-800">
+                    <span>Stale-session job</span>
+                    <span className="uppercase">{staleJob.status}</span>
+                  </div>
+                  <p className="text-xs text-slate-600">Job ID: {staleJob.id}</p>
+                </div>
+              ) : null}
+
+              {staleLastResult ? (
+                <div className="mt-4 rounded-lg border border-emerald-200 bg-white p-3 text-xs text-slate-700">
+                  <p className="font-semibold text-emerald-800">Last stale-session run result</p>
+                  <p className="mt-1">Evaluated: {staleLastResult.evaluated ?? 0}</p>
+                  <p>Completed sessions: {staleLastResult.completedSessions ?? 0}</p>
+                  <p>Pending sessions: {staleLastResult.pendingSessions ?? 0}</p>
+                  <p>Errors: {Array.isArray(staleLastResult.errors) ? staleLastResult.errors.length : 0}</p>
                 </div>
               ) : null}
             </div>

@@ -162,7 +162,7 @@ export default function Schedule() {
             <p className="text-sm font-semibold text-teal-900">Interview Started At</p>
             <p className="mt-2 text-sm text-teal-800">{formatUtcTime(startedAt)}</p>
 
-            {interviewPlan?.questions?.length > 0 && (
+            {interviewPlan?.questions?.length > 0 && latestSession?.status !== 'completed' && (
               <div className="mt-4 rounded-lg border border-white/70 bg-white/70 p-3">
                 <p className="text-sm font-semibold text-teal-900">Role-based questions</p>
                 <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-teal-800">

@@ -6,16 +6,41 @@ import { Toaster } from 'react-hot-toast';
 // Layouts
 import Navbar from './components/layout/Navbar';
 
+const CHUNK_RELOAD_FLAG = '__jarvisChunkReloaded';
+
+const lazyWithRetry = (importer) =>
+  lazy(async () => {
+    try {
+      return await importer();
+    } catch (error) {
+      const isChunkLoadFailure =
+        typeof error?.message === 'string' &&
+        (error.message.includes('Failed to fetch dynamically imported module') ||
+          error.message.includes('Importing a module script failed'));
+
+      if (isChunkLoadFailure) {
+        const alreadyReloaded = window.sessionStorage.getItem(CHUNK_RELOAD_FLAG) === '1';
+        if (!alreadyReloaded) {
+          window.sessionStorage.setItem(CHUNK_RELOAD_FLAG, '1');
+          window.location.reload();
+          return { default: () => null };
+        }
+      }
+
+      throw error;
+    }
+  });
+
 // Pages
-const Landing = lazy(() => import('./pages/Landing'));
-const Login = lazy(() => import('./pages/auth/Login'));
-const Signup = lazy(() => import('./pages/auth/Signup'));
-const CandidateDashboard = lazy(() => import('./pages/candidate/Dashboard'));
-const ProfileUpload = lazy(() => import('./pages/candidate/ProfileUpload'));
-const Schedule = lazy(() => import('./pages/candidate/Schedule'));
-const Interview = lazy(() => import('./pages/candidate/Interview'));
-const AdminDashboard = lazy(() => import('./pages/admin/Dashboard'));
-const CandidateDetails = lazy(() => import('./pages/admin/CandidateDetails'));
+const Landing = lazyWithRetry(() => import('./pages/Landing'));
+const Login = lazyWithRetry(() => import('./pages/auth/Login'));
+const Signup = lazyWithRetry(() => import('./pages/auth/Signup'));
+const CandidateDashboard = lazyWithRetry(() => import('./pages/candidate/Dashboard'));
+const ProfileUpload = lazyWithRetry(() => import('./pages/candidate/ProfileUpload'));
+const Schedule = lazyWithRetry(() => import('./pages/candidate/Schedule'));
+const Interview = lazyWithRetry(() => import('./pages/candidate/Interview'));
+const AdminDashboard = lazyWithRetry(() => import('./pages/admin/Dashboard'));
+const CandidateDetails = lazyWithRetry(() => import('./pages/admin/CandidateDetails'));
 
 const ProtectedRoute = ({ children, allowedRoles }) => {
   const { user, role, loading } = useAuth();
@@ -105,9 +130,10 @@ class RouteErrorBoundary extends React.Component {
 }
 
 function MainRoutes() {
+  const location = useLocation();
+
   return (
-    <Router>
-      <RouteErrorBoundary>
+      <RouteErrorBoundary key={location.pathname}>
         <InterviewLockGuard>
           <div className="flex min-h-screen w-full flex-col bg-slate-50">
             <Navbar />
@@ -201,14 +227,15 @@ function MainRoutes() {
           </div>
         </InterviewLockGuard>
       </RouteErrorBoundary>
-    </Router>
   );
 }
 
 function App() {
   return (
     <AuthProvider>
-      <MainRoutes />
+      <Router>
+        <MainRoutes />
+      </Router>
     </AuthProvider>
   );
 }
