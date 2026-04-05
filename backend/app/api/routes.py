@@ -3819,14 +3819,8 @@ def admin_candidate_details(request_obj: Request, candidate_id: str) -> dict[str
         except Exception:
             inferred_role = None
 
-    if latest_upload and not candidate.get("ai_summary"):
-        try:
-            analysis = _build_resume_analysis(candidate, latest_upload)
-            _persist_candidate_analysis(candidate["id"], analysis)
-            candidate = {**candidate, **analysis}
-        except Exception:
-            # Keep admin detail view available even if scoring provider is down.
-            pass
+    # Keep candidate detail reads fast. Expensive resume analysis should be explicit
+    # through the admin analyze endpoint instead of running during page load.
 
     return _candidate_detail_payload(
         candidate,

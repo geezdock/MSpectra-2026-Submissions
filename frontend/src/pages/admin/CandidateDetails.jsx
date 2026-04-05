@@ -1,5 +1,5 @@
 import React from 'react';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { ChevronLeft, FileText, MicVocal, PlayCircle, Sparkle, WandSparkles } from 'lucide-react';
@@ -24,6 +24,7 @@ export default function CandidateDetails() {
   const [retryingScore, setRetryingScore] = useState(false);
   const [candidateStage, setCandidateStage] = useState('');
   const [stageSaving, setStageSaving] = useState(false);
+  const [loadError, setLoadError] = useState('');
 
   const CANDIDATE_STAGES = [
     'profile_pending',
@@ -70,49 +71,53 @@ export default function CandidateDetails() {
     return <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">Scoring Pending</span>;
   };
 
-  useEffect(() => {
-    let cancelled = false;
+  const fetchCandidateDetails = useCallback(async () => {
+    if (!id) {
+      setDetails(null);
+      setLoadError('Missing candidate id in URL.');
+      setLoading(false);
+      return;
+    }
 
-    const fetchCandidateDetails = async () => {
-      try {
-        const response = await api.get(`/admin/candidates/${id}`);
-        if (cancelled) return;
+    try {
+      setLoading(true);
+      setLoadError('');
+      const response = await api.get(`/admin/candidates/${id}`);
 
-        setDetails(response.data);
-        hasLoadedDetailsRef.current = true;
-        setTargetRole(response.data?.candidate?.targetRole || '');
-        setAdminOverrideRole(response.data?.candidate?.adminOverrideRole || '');
-        setCandidateStage(response.data?.candidate?.currentStage || 'profile_pending');
+      setDetails(response.data);
+      hasLoadedDetailsRef.current = true;
+      setTargetRole(response.data?.candidate?.targetRole || '');
+      setAdminOverrideRole(response.data?.candidate?.adminOverrideRole || '');
+      setCandidateStage(response.data?.candidate?.currentStage || 'profile_pending');
 
-        const sessions = response.data?.interviewSessions || [];
-        const preferredSession =
-          sessions.find((session) => session?.status === 'completed') ||
-          sessions.find((session) => session?.status === 'failed') ||
-          sessions[0];
-        const firstSessionId = preferredSession?.id || '';
-        setSelectedSessionId(firstSessionId);
-        if (firstSessionId) {
-          await loadInterviewSession(firstSessionId);
-        } else {
-          setSessionDetails(null);
-        }
-      } catch (_error) {
-        if (!cancelled && !hasLoadedDetailsRef.current) {
-          setDetails(null);
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
+      const sessions = response.data?.interviewSessions || [];
+      const preferredSession =
+        sessions.find((session) => session?.status === 'completed') ||
+        sessions.find((session) => session?.status === 'failed') ||
+        sessions[0];
+      const firstSessionId = preferredSession?.id || '';
+      setSelectedSessionId(firstSessionId);
+      if (firstSessionId) {
+        await loadInterviewSession(firstSessionId);
+      } else {
+        setSessionDetails(null);
       }
-    };
-
-    fetchCandidateDetails();
-
-    return () => {
-      cancelled = true;
-    };
+    } catch (error) {
+      const fallbackMessage = 'Unable to load candidate details right now.';
+      const message = error?.message || fallbackMessage;
+      if (!hasLoadedDetailsRef.current) {
+        setDetails(null);
+      }
+      setLoadError(message);
+      toast.error(message);
+    } finally {
+      setLoading(false);
+    }
   }, [id]);
+
+  useEffect(() => {
+    fetchCandidateDetails();
+  }, [fetchCandidateDetails]);
 
   const onAnalyzeResume = async () => {
     try {
@@ -195,7 +200,11 @@ export default function CandidateDetails() {
         <Link to="/admin" className="inline-flex items-center gap-1 text-sm font-medium text-slate-600 hover:text-slate-900">
           <ChevronLeft size={16} /> Back to dashboard
         </Link>
-        <p className="text-slate-600">Candidate details are unavailable.</p>
+        <div className="rounded-xl border border-rose-200 bg-rose-50 p-4 text-rose-800">
+          <p className="text-sm font-semibold">Candidate details are unavailable.</p>
+          {loadError ? <p className="mt-1 text-sm">{loadError}</p> : null}
+          <Button className="mt-3" onClick={fetchCandidateDetails}>Retry loading details</Button>
+        </div>
       </div>
     );
   }
