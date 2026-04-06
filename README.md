@@ -4,7 +4,7 @@ A full-stack AI-powered recruiting platform that automates candidate interviews,
 
 ## 🔗 Getting Started
 
-- **Live Demo** – https://jarvis-psi-black.vercel.app/
+- **Live Demo** – mspectrajarvis.vercel.app
 - **Video Demo** – https://drive.google.com/file/d/1yvVjBhtDjfvqg90655x78XTWlsI1GIAn/view?usp=sharing
 - **Presentation** – https://app.presentations.ai/view/mvJy3HG5ZD
 
