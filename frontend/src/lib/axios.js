@@ -3,8 +3,12 @@ import { hasSupabaseConfig, supabase } from './supabase';
 
 const envApiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').trim();
 const isBrowser = typeof window !== 'undefined';
-const isLocalHostname = isBrowser && ['localhost', '127.0.0.1'].includes(window.location.hostname);
-const resolvedApiBaseUrl = envApiBaseUrl || (isLocalHostname ? 'http://127.0.0.1:8000' : '');
+const isDev = Boolean(import.meta.env.DEV);
+const localHostPattern = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/;
+const privateHostPattern = /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[0-1])\.)/;
+const hostname = isBrowser ? window.location.hostname : '';
+const isLocalHostname = isBrowser && (localHostPattern.test(hostname) || privateHostPattern.test(hostname));
+const resolvedApiBaseUrl = envApiBaseUrl || (isDev || isLocalHostname ? 'http://127.0.0.1:8000' : '');
 
 const api = axios.create({
   baseURL: resolvedApiBaseUrl,
@@ -59,11 +63,15 @@ api.interceptors.response.use(
       errorMsg = detail || 'Server Error: 500 - The server encountered an error. Check backend logs.';
     } else if (status) {
       errorMsg = detail || message || `HTTP ${status} Error: ${error?.response?.statusText || 'Unknown'}`;
-    } else if (networkError?.includes('timeout')) {
+    } else if (networkError?.toLowerCase().includes('timeout')) {
       errorMsg = '408 Timeout: Request took too long. Backend may not be responding.';
-    } else if (networkError?.includes('CORS')) {
+    } else if (networkError?.toLowerCase().includes('cors')) {
       errorMsg = 'CORS Error: Backend or frontend URL mismatch. Check that server is running.';
-    } else if (networkError?.includes('ERR_NETWORK') || networkError?.includes('ERR_FAILED') || networkError?.includes('connect')) {
+    } else if (
+      networkError?.includes('ERR_NETWORK') ||
+      networkError?.includes('ERR_FAILED') ||
+      networkError?.toLowerCase().includes('connect')
+    ) {
       errorMsg = 'Network Error: Cannot connect to backend at ' + api.defaults.baseURL;
     } else {
       errorMsg = detail || message || networkError || 'Unexpected API error';
